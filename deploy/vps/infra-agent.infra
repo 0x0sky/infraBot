@@ -24,6 +24,7 @@ agent {
         fields = ["input", "docker_address", "container", "container_id", "project", "service", "image", "state", "health"]
     }
 
+    # output name is the Telegram bot username
     output "infra_services_bot" {
         driver = "infrabot"
         endpoint = "http://infra-bot:8787"

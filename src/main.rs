@@ -74,6 +74,7 @@ struct TokenResponse {
 
 #[derive(Deserialize)]
 struct EventRequest {
+    output: String,
     kind: String,
     project: String,
     service: Option<String>,
@@ -281,6 +282,10 @@ async fn deliver_event(
     {
         return api_error(StatusCode::FORBIDDEN, "source_not_authorized");
     }
+    if request.output.trim_start_matches('@') != state.config.telegram_bot_username {
+        return api_error(StatusCode::BAD_REQUEST, "unknown_output");
+    }
+
     if !valid_event(&request) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_event");
     }
@@ -396,7 +401,8 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn valid_event(event: &EventRequest) -> bool {
-    valid_token(&event.kind, 128)
+    valid_token(&event.output, 64)
+        && valid_token(&event.kind, 128)
         && valid_text(&event.project, 128)
         && event
             .service
@@ -475,6 +481,7 @@ mod tests {
     #[test]
     fn validates_and_renders_events() {
         let event = EventRequest {
+            output: "infra_services_bot".into(),
             kind: "service.failed".into(),
             project: "market".into(),
             service: Some("api".into()),
