@@ -23,6 +23,7 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("src/main.rs")
           text = path.read_text()
@@ -33,76 +34,88 @@ jobs:
               raise SystemExit("std collections import not found")
           text = text.replace(old, new, 1)
 
-          old = '''    status: Option<String>,
-              message: String,
+          marker = '''    message: String,
           }'''
-          new = '''    status: Option<String>,
-              message: String,
+          replacement = '''    message: String,
               #[serde(default)]
               fields: BTreeMap<String, String>,
           }'''
-          if old not in text:
-              raise SystemExit("EventRequest fields not found")
-          text = text.replace(old, new, 1)
+          if marker not in text:
+              raise SystemExit("EventRequest tail not found")
+          text = text.replace(marker, replacement, 1)
 
-          old = '''        && valid_text(&event.message, 4_000)
-          }'''
-          new = '''        && valid_text(&event.message, 4_000)
-              && event.fields.len() <= 24
-              && event
-                  .fields
-                  .iter()
-                  .all(|(name, value)| valid_token(name, 64) && valid_text(value, 512))
-              && event.fields.values().map(String::len).sum::<usize>() <= 4_096
-          }'''
-          if old not in text:
-              raise SystemExit("valid_event tail not found")
-          text = text.replace(old, new, 1)
+          pattern = re.compile(r'''fn valid_event\(event: &EventRequest\) -> bool \{.*?\n\}\n\nfn valid_token''', re.S)
+          replacement = '''fn valid_event(event: &EventRequest) -> bool {
+              valid_token(&event.kind, 128)
+                  && valid_text(&event.project, 128)
+                  && event
+                      .service
+                      .as_deref()
+                      .is_none_or(|value| valid_text(value, 128))
+                  && event
+                      .status
+                      .as_deref()
+                      .is_none_or(|value| valid_text(value, 64))
+                  && valid_text(&event.message, 4_000)
+                  && event.fields.len() <= 24
+                  && event
+                      .fields
+                      .iter()
+                      .all(|(name, value)| valid_token(name, 64) && valid_text(value, 512))
+                  && event.fields.values().map(String::len).sum::<usize>() <= 4_096
+          }
 
-          old = '''    if let Some(service) = event.service.as_deref() {
-              lines.push(format!("service: {service}"));
-          }
-          if let Some(status) = event.status.as_deref() {
-              lines.push(format!("status: {status}"));
-          }
-          lines.push(String::new());'''
-          new = '''    if event.fields.is_empty() {
-              if let Some(service) = event.service.as_deref() {
-                  lines.push(format!("service: {service}"));
-              }
-              if let Some(status) = event.status.as_deref() {
-                  lines.push(format!("status: {status}"));
-              }
-          } else {
-              for (name, value) in &event.fields {
-                  lines.push(format!("{name}: {value}"));
-              }
-          }
-          lines.push(String::new());'''
-          if old not in text:
-              raise SystemExit("render_event projection block not found")
-          text = text.replace(old, new, 1)
+          fn valid_token'''
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit("valid_event function not found")
 
-          old = '''            status: Some("unhealthy".into()),
-                  message: "health check failed".into(),
+          pattern = re.compile(r'''fn render_event\(source: &str, event: &EventRequest\) -> String \{.*?\n\}\n\nfn secure_eq''', re.S)
+          replacement = '''fn render_event(source: &str, event: &EventRequest) -> String {
+              let mut lines = vec![
+                  format!("{} · {}", event.kind, event.project),
+                  format!("source: {source}"),
+              ];
+              if event.fields.is_empty() {
+                  if let Some(service) = event.service.as_deref() {
+                      lines.push(format!("service: {service}"));
+                  }
+                  if let Some(status) = event.status.as_deref() {
+                      lines.push(format!("status: {status}"));
+                  }
+              } else {
+                  for (name, value) in &event.fields {
+                      lines.push(format!("{name}: {value}"));
+                  }
+              }
+              lines.push(String::new());
+              lines.push(event.message.trim().to_owned());
+              lines.join("\\n")
+          }
+
+          fn secure_eq'''
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit("render_event function not found")
+
+          marker = '''            message: "health check failed".into(),
               };'''
-          new = '''            status: Some("unhealthy".into()),
-                  message: "health check failed".into(),
+          replacement = '''            message: "health check failed".into(),
                   fields: BTreeMap::from([
                       ("image".into(), "market:latest".into()),
                       ("previous_status".into(), "healthy".into()),
                   ]),
               };'''
-          if old not in text:
+          if marker not in text:
               raise SystemExit("event test fixture not found")
-          text = text.replace(old, new, 1)
+          text = text.replace(marker, replacement, 1)
 
-          old = '''        assert!(rendered.contains("source: primary"));'''
-          new = '''        assert!(rendered.contains("source: primary"));
+          marker = '        assert!(rendered.contains("source: primary"));'
+          replacement = '''        assert!(rendered.contains("source: primary"));
               assert!(rendered.contains("image: market:latest"));'''
-          if old not in text:
-              raise SystemExit("event render assertion not found")
-          text = text.replace(old, new, 1)
+          if marker not in text:
+              raise SystemExit("render assertion not found")
+          text = text.replace(marker, replacement, 1)
 
           path.write_text(text)
           PY
