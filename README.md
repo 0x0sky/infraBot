@@ -6,16 +6,18 @@ Secure Telegram authorization and notification gateway for [`infraCLI`](https://
 
 ## topology
 
-One infraBot deployment and one Telegram bot may authorize multiple independent infraCLI sources:
+The first deployment colocates infraBot with the existing market workloads on `vps-spaceship-01`:
 
 ```text
-infraCLI · primary ─┐
-                    ├──► infraBot API ───► one Telegram bot
-infraCLI · secondary┘             │
-                                  └──► configured recipients
+0xda-market       ─┐
+                   ├──► infraBot API ───► one Telegram bot
+0xda-market-bot   ─┘           │
+                               └──► configured recipients
+
+shared edge: https://0xda-market.nilx.one/infra/*
 ```
 
-Every source has an independent pairing session, verifier, source-bound access token, and local credential file. Authorizing `secondary` does not overwrite or revoke `primary`.
+Every source has an independent pairing session, verifier, source-bound access token, and local credential file. Authorizing `0xda-market-bot` does not overwrite or revoke `0xda-market`.
 
 ## `.infra` registry
 
@@ -36,7 +38,7 @@ project "infrabot" {
 
 infrabot {
     bind = "0.0.0.0:8787"
-    public_url = env("INFRABOT_PUBLIC_URL")
+    public_url = "https://0xda-market.nilx.one/infra"
     pairing_ttl_seconds = 300
     access_token_ttl_seconds = 2592000
     poll_interval_seconds = 2
@@ -51,12 +53,12 @@ infrabot {
         allowed_user_ids = env("TELEGRAM_ALLOWED_USER_IDS")
     }
 
-    source "primary" {
-        address = "https://primary.example"
+    source "0xda-market" {
+        address = "https://0xda-market.nilx.one"
     }
 
-    source "secondary" {
-        address = "https://secondary.example"
+    source "0xda-market-bot" {
+        address = "https://0xda-market.nilx.one/bot"
     }
 
     recipient "owner" {
@@ -66,7 +68,7 @@ infrabot {
 }
 ```
 
-Replace the example source URLs with the real API addresses of the authorized infraCLI hosts. Addresses, source IDs, recipients, event filters, and policy live directly in `.infra`; only secrets and Telegram identities are resolved from the environment.
+Addresses, source IDs, recipients, event filters, and policy live directly in `.infra`; only secrets and Telegram identities are resolved from the environment.
 
 The registry is loaded and validated when the process starts. Changing a source, recipient, event filter, or policy requires an infraBot restart; the first version does not hot-reload configuration. Unknown blocks or fields, duplicate identifiers, missing environment references, literal secret values, insecure remote URLs, empty source sets, and empty recipient sets fail startup.
 
@@ -94,12 +96,12 @@ Authorize each source separately:
 
 ```bash
 infra auth telegram \
-  --endpoint https://<infrabot-host> \
-  --source primary
+  --endpoint https://0xda-market.nilx.one/infra \
+  --source 0xda-market
 
 infra auth telegram \
-  --endpoint https://<infrabot-host> \
-  --source secondary \
+  --endpoint https://0xda-market.nilx.one/infra \
+  --source 0xda-market-bot \
   --no-open
 ```
 
@@ -164,13 +166,13 @@ Before horizontal scaling, move pairing and future delivery state to a shared at
 Start from `.env.example`. It supplies runtime values referenced by `.infra`:
 
 ```text
-INFRABOT_PUBLIC_URL
 TELEGRAM_BOT_TOKEN
 TELEGRAM_BOT_USERNAME
 TELEGRAM_WEBHOOK_SECRET
 TELEGRAM_ALLOWED_USER_IDS
 TELEGRAM_CHAT_ID
 INFRABOT_SIGNING_SECRET
+MARKET_EDGE_NETWORK
 ```
 
 `TELEGRAM_WEBHOOK_SECRET` must contain 16–256 URL-safe characters. `INFRABOT_SIGNING_SECRET` must contain at least 32 random bytes and must differ from the bot token and webhook secret. Rotating it invalidates issued tokens.
@@ -186,7 +188,7 @@ Local execution reads `./.infra` by default. Set `INFRABOT_CONFIG` to load anoth
 Configure Telegram's webhook as:
 
 ```text
-https://<infrabot-host>/telegram/webhook
+https://0xda-market.nilx.one/infra/telegram/webhook
 ```
 
 Put the service behind HTTPS and rate-limit `POST /v1/pairings` and `POST /v1/events` at the edge.
@@ -202,10 +204,15 @@ The image contains the repository `.infra` at `/etc/infrabot/.infra`. Changing t
 
 Run one replica until pairing state moves to a shared store.
 
+## VPS deployment
+
+The colocated VPS release contract, runtime layout, manual `validate/activate` workflow, rollback behavior, and activation order are documented in [`deploy/vps/README.md`](deploy/vps/README.md).
+
 ## development
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
+bash -n deploy/vps/deploy.sh deploy/vps/verify.sh
 ```
