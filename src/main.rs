@@ -1,5 +1,6 @@
 mod config;
 mod store;
+mod subscribers;
 mod telegram;
 mod token;
 
@@ -20,8 +21,9 @@ use std::{
     time::Duration,
 };
 use store::{ApproveOutcome, CreateOutcome, ExchangeOutcome, PairingStore, decode_challenge};
+use subscribers::{SubscribeOutcome, SubscriberStore};
 use subtle::ConstantTimeEq;
-use telegram::{TelegramUpdate, send_message, start_payload};
+use telegram::{TelegramCommand, TelegramUpdate, command, send_message};
 use token::{issue_access_token, verify_access_token};
 use tokio::{net::TcpListener, sync::Mutex};
 use tracing::{info, warn};
@@ -34,6 +36,7 @@ const TELEGRAM_SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
 struct AppState {
     config: Arc<Config>,
     store: Arc<Mutex<PairingStore>>,
+    subscribers: Arc<Mutex<SubscriberStore>>,
     http: Client,
 }
 
@@ -137,6 +140,9 @@ async fn main() -> Result<()> {
         config.max_active_pairings,
         config.max_exchange_attempts,
     );
+    let subscribers = SubscriberStore::load(config.subscriber_store.clone())?;
+    let subscriber_count = subscribers.len();
+    info!(subscriber_count, "Telegram subscribers loaded");
     let http = Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(concat!("infraBot/", env!("CARGO_PKG_VERSION")))
@@ -145,6 +151,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         config: Arc::clone(&config),
         store: Arc::new(Mutex::new(store)),
+        subscribers: Arc::new(Mutex::new(subscribers)),
         http,
     };
 
@@ -290,13 +297,19 @@ async fn deliver_event(
         return api_error(StatusCode::BAD_REQUEST, "invalid_event");
     }
 
-    let chat_ids = state
+    let mut chat_ids = state
         .config
         .recipients
         .iter()
         .filter(|recipient| recipient_matches(recipient, &request.kind))
         .map(|recipient| recipient.chat_id)
         .collect::<HashSet<_>>();
+    if state.config.subscriber_events.contains("*")
+        || state.config.subscriber_events.contains(&request.kind)
+    {
+        let subscribers = state.subscribers.lock().await;
+        chat_ids.extend(subscribers.chat_ids());
+    }
     let attempted = chat_ids.len();
     let message = render_event(&authorized.source, &request);
     let mut delivered = 0;
@@ -354,26 +367,98 @@ async fn telegram_webhook(
     let Some(text) = message.text.as_deref() else {
         return StatusCode::OK.into_response();
     };
-    let Some(payload) = start_payload(text) else {
+    let Some(command) = command(text) else {
         return StatusCode::OK.into_response();
     };
 
-    let reply = if !state.config.allowed_user_ids.contains(&user.id) {
-        "this Telegram account is not authorized for infraCLI".to_owned()
-    } else {
-        let outcome = {
-            let mut store = state.store.lock().await;
-            store.approve(payload, user.id)
-        };
-        match outcome {
-            ApproveOutcome::Approved(source) | ApproveOutcome::AlreadyApproved(source) => {
-                format!("infraCLI source {source} authorized. return to the terminal")
+    let reply = match command {
+        TelegramCommand::Subscribe => {
+            if !state.config.subscriber_user_ids.contains(&user.id) {
+                "this Telegram account is not allowed to subscribe".to_owned()
+            } else {
+                let outcome = {
+                    let mut subscribers = state.subscribers.lock().await;
+                    subscribers.subscribe(user.id, message.chat.id)
+                };
+                match outcome {
+                    Ok(SubscribeOutcome::Added | SubscribeOutcome::Updated) => {
+                        "subscribed to infra notifications".to_owned()
+                    }
+                    Ok(SubscribeOutcome::AlreadySubscribed) => {
+                        "already subscribed to infra notifications".to_owned()
+                    }
+                    Err(error) => {
+                        warn!(user_id = user.id, error = %error, "subscriber persistence failed");
+                        "subscription could not be saved".to_owned()
+                    }
+                }
             }
-            ApproveOutcome::DifferentUser => {
-                "this pairing belongs to another Telegram account".to_owned()
+        }
+        TelegramCommand::Unsubscribe => {
+            if !state.config.subscriber_user_ids.contains(&user.id) {
+                "this Telegram account is not allowed to subscribe".to_owned()
+            } else {
+                let outcome = {
+                    let mut subscribers = state.subscribers.lock().await;
+                    subscribers.unsubscribe(user.id)
+                };
+                match outcome {
+                    Ok(true) => "unsubscribed from infra notifications".to_owned(),
+                    Ok(false) => "not subscribed to infra notifications".to_owned(),
+                    Err(error) => {
+                        warn!(user_id = user.id, error = %error, "subscriber persistence failed");
+                        "subscription change could not be saved".to_owned()
+                    }
+                }
             }
-            ApproveOutcome::Expired | ApproveOutcome::Consumed | ApproveOutcome::NotFound => {
-                "pairing expired or already used. run infra auth again".to_owned()
+        }
+        TelegramCommand::Status => {
+            if !state.config.subscriber_user_ids.contains(&user.id) {
+                "this Telegram account is not allowed to subscribe".to_owned()
+            } else {
+                let subscribed = {
+                    let subscribers = state.subscribers.lock().await;
+                    subscribers.is_subscribed(user.id)
+                };
+                if subscribed {
+                    "subscribed to infra notifications".to_owned()
+                } else {
+                    "not subscribed to infra notifications".to_owned()
+                }
+            }
+        }
+        TelegramCommand::Approve(payload) => {
+            if !state.config.allowed_user_ids.contains(&user.id) {
+                "this Telegram account cannot authorize infra sources".to_owned()
+            } else {
+                let outcome = {
+                    let mut store = state.store.lock().await;
+                    store.approve(payload, user.id)
+                };
+                match outcome {
+                    ApproveOutcome::Approved(source) | ApproveOutcome::AlreadyApproved(source) => {
+                        if state.config.subscriber_user_ids.contains(&user.id) {
+                            let subscription = {
+                                let mut subscribers = state.subscribers.lock().await;
+                                subscribers.subscribe(user.id, message.chat.id)
+                            };
+                            if let Err(error) = subscription {
+                                warn!(user_id = user.id, error = %error, "subscriber persistence failed after pairing");
+                            }
+                        }
+                        format!(
+                            "infraCLI source {source} authorized. notifications enabled when permitted"
+                        )
+                    }
+                    ApproveOutcome::DifferentUser => {
+                        "this pairing belongs to another Telegram account".to_owned()
+                    }
+                    ApproveOutcome::Expired
+                    | ApproveOutcome::Consumed
+                    | ApproveOutcome::NotFound => {
+                        "pairing expired or already used. run infra auth again".to_owned()
+                    }
+                }
             }
         }
     };
@@ -386,7 +471,7 @@ async fn telegram_webhook(
     )
     .await
     {
-        warn!("Telegram sendMessage failed");
+        warn!(user_id = user.id, "Telegram sendMessage failed");
     }
     StatusCode::OK.into_response()
 }

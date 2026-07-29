@@ -11,6 +11,8 @@ services:
       - .env
     ports:
       - "127.0.0.1:8787:8787"
+    volumes:
+      - infrabot-state:/var/lib/infrabot
     networks:
       edge:
         aliases:
@@ -139,4 +141,5 @@ networks:
     internal: true
 
 volumes:
+  infrabot-state:
   infra-agent-state:

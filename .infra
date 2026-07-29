@@ -27,14 +27,13 @@ infrabot {
         webhook_secret = env("TELEGRAM_WEBHOOK_SECRET")
         signing_secret = env("INFRABOT_SIGNING_SECRET")
         allowed_user_ids = env("TELEGRAM_ALLOWED_USER_IDS")
+        subscriber_user_ids = env("TELEGRAM_SUBSCRIBER_USER_IDS")
+        subscriber_store = "/var/lib/infrabot/subscribers.json"
+        subscriber_events = ["service.failed", "service.recovered", "service.started", "service.removed"]
     }
 
     source "vps-spaceship-01" {
         address = "https://0xda-market.nilx.one"
     }
 
-    recipient "owner" {
-        chat_id = env("TELEGRAM_CHAT_ID")
-        events = ["service.failed", "service.recovered", "service.started", "service.removed"]
-    }
 }

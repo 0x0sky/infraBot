@@ -212,3 +212,8 @@ docker run --rm --network zero-x-infrabot-vps-spaceship-01-monitor alpine:3.22 \
 - the source credential is stored outside releases with directory mode `0700` and file mode `0600`;
 - failed activation attempts to restore the previous release;
 - DNS, Caddy, market services, databases, and Telegram webhook state remain separate operations.
+
+
+## Telegram subscribers
+
+`TELEGRAM_ALLOWED_USER_IDS` contains operators allowed to approve infra pairing. `TELEGRAM_SUBSCRIBER_USER_IDS` contains every Telegram user allowed to join the broadcast with `/start`; use comma-separated numeric IDs. Subscription state is persisted in the `infrabot-state` volume and survives container replacement and release rollback.

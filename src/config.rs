@@ -16,6 +16,9 @@ pub struct Config {
     pub telegram_webhook_secret: String,
     pub signing_secret: String,
     pub allowed_user_ids: HashSet<i64>,
+    pub subscriber_user_ids: HashSet<i64>,
+    pub subscriber_store: PathBuf,
+    pub subscriber_events: HashSet<String>,
     pub sources: HashMap<String, String>,
     pub recipients: Vec<RecipientConfig>,
     pub pairing_ttl_seconds: u64,
@@ -59,6 +62,9 @@ struct TelegramBuilder {
     webhook_secret: Option<ValueRef>,
     signing_secret: Option<ValueRef>,
     allowed_user_ids: Option<ValueRef>,
+    subscriber_user_ids: Option<ValueRef>,
+    subscriber_store: Option<ValueRef>,
+    subscriber_events: Option<Vec<String>>,
 }
 
 struct SourceBuilder {
@@ -189,14 +195,56 @@ fn parse_telegram(lines: &[(usize, &str)], index: &mut usize) -> Result<Telegram
         if line == "}" {
             return Ok(builder);
         }
-        let (key, value) = assignment(line_number, line)?;
-        let value = value_ref(line_number, value)?;
+        let (key, raw) = assignment(line_number, line)?;
         match key {
-            "bot_username" => set_once(&mut builder.bot_username, value, line_number, key)?,
-            "bot_token" => set_once(&mut builder.bot_token, value, line_number, key)?,
-            "webhook_secret" => set_once(&mut builder.webhook_secret, value, line_number, key)?,
-            "signing_secret" => set_once(&mut builder.signing_secret, value, line_number, key)?,
-            "allowed_user_ids" => set_once(&mut builder.allowed_user_ids, value, line_number, key)?,
+            "subscriber_events" => set_once(
+                &mut builder.subscriber_events,
+                string_list(line_number, raw)?,
+                line_number,
+                key,
+            )?,
+            "bot_username" => set_once(
+                &mut builder.bot_username,
+                value_ref(line_number, raw)?,
+                line_number,
+                key,
+            )?,
+            "bot_token" => set_once(
+                &mut builder.bot_token,
+                value_ref(line_number, raw)?,
+                line_number,
+                key,
+            )?,
+            "webhook_secret" => set_once(
+                &mut builder.webhook_secret,
+                value_ref(line_number, raw)?,
+                line_number,
+                key,
+            )?,
+            "signing_secret" => set_once(
+                &mut builder.signing_secret,
+                value_ref(line_number, raw)?,
+                line_number,
+                key,
+            )?,
+            "allowed_user_ids" => set_once(
+                &mut builder.allowed_user_ids,
+                value_ref(line_number, raw)?,
+                line_number,
+                key,
+            )?,
+            "subscriber_user_ids" => set_once(
+                &mut builder.subscriber_user_ids,
+                value_ref(line_number, raw)?,
+                line_number,
+                key,
+            )?,
+            "subscriber_store" => set_once(
+                &mut builder.subscriber_store,
+                value_ref(line_number, raw)?,
+                line_number,
+                key,
+            )?,
             _ => bail!("line {line_number}: unknown telegram field {key}"),
         }
     }
@@ -299,6 +347,31 @@ where
     if allowed_user_ids.is_empty() {
         bail!("telegram.allowed_user_ids must contain at least one user id");
     }
+    let subscriber_user_ids = match telegram.subscriber_user_ids {
+        Some(value) => parse_i64_set(&value.resolve("telegram.subscriber_user_ids", resolver)?)
+            .context("telegram.subscriber_user_ids must be comma-separated integers")?,
+        None => allowed_user_ids.clone(),
+    };
+    if subscriber_user_ids.is_empty() {
+        bail!("telegram.subscriber_user_ids must contain at least one user id");
+    }
+    let subscriber_store = PathBuf::from(resolve_or(
+        telegram.subscriber_store,
+        "/var/lib/infrabot/subscribers.json",
+        "telegram.subscriber_store",
+        resolver,
+    )?);
+    if !subscriber_store.is_absolute() {
+        bail!("telegram.subscriber_store must be an absolute path");
+    }
+    let subscriber_events = telegram
+        .subscriber_events
+        .context("telegram.subscriber_events is required")?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if subscriber_events.is_empty() {
+        bail!("telegram.subscriber_events must contain at least one event");
+    }
     if !(16..=256).contains(&telegram_webhook_secret.len())
         || !telegram_webhook_secret
             .chars()
@@ -354,10 +427,6 @@ where
             events,
         });
     }
-    if recipients.is_empty() {
-        bail!("infrabot must declare at least one recipient");
-    }
-
     Ok(Config {
         bind_addr,
         public_url,
@@ -366,6 +435,9 @@ where
         telegram_webhook_secret,
         signing_secret,
         allowed_user_ids,
+        subscriber_user_ids,
+        subscriber_store,
+        subscriber_events,
         sources,
         recipients,
         pairing_ttl_seconds: bounded_u64(
@@ -611,7 +683,8 @@ mod tests {
             "BOT_TOKEN" => Some("bot-token".into()),
             "WEBHOOK_SECRET" => Some("webhook-secret-1234".into()),
             "SIGNING_SECRET" => Some("x".repeat(32)),
-            "ALLOWED_USERS" => Some("42,77".into()),
+            "ALLOWED_USERS" => Some("42".into()),
+            "SUBSCRIBERS" => Some("42,77".into()),
             "OWNER_CHAT" => Some("42".into()),
             _ => None,
         }
@@ -640,6 +713,9 @@ infrabot {
         webhook_secret = env("WEBHOOK_SECRET")
         signing_secret = env("SIGNING_SECRET")
         allowed_user_ids = env("ALLOWED_USERS")
+        subscriber_user_ids = env("SUBSCRIBERS")
+        subscriber_store = "/var/lib/infrabot/subscribers.json"
+        subscriber_events = ["service.failed", "service.recovered"]
     }
 
     source "primary" {
@@ -659,6 +735,8 @@ infrabot {
         let config = parse_document(document(), &resolver).unwrap();
         assert_eq!(config.public_url, "https://bot.example");
         assert_eq!(config.sources["primary"], "https://primary.example");
+        assert_eq!(config.subscriber_user_ids.len(), 2);
+        assert!(config.subscriber_events.contains("service.failed"));
         assert_eq!(config.recipients[0].chat_id, 42);
         assert!(config.recipients[0].events.contains("service.failed"));
     }

@@ -205,3 +205,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 bash -n deploy/vps/deploy.sh deploy/vps/verify.sh
 ```
+
+## Multi-user Telegram subscriptions
+
+One Telegram bot can broadcast the same filtered infra events to multiple private users. `telegram.allowed_user_ids` remains the operator allowlist for approving CLI pairing. `telegram.subscriber_user_ids` is a separate allowlist for notification recipients and may contain more users.
+
+Users connect directly in Telegram:
+
+- `/start` subscribes the current private chat
+- `/stop` removes that user from broadcasts
+- `/status` reports the current subscription state
+- `/start <pairing-token>` authorizes a source for an operator and subscribes that operator when also present in the subscriber allowlist
+
+Subscriptions are persisted atomically in `telegram.subscriber_store`. Static `recipient` blocks remain optional and are combined with dynamic subscribers using chat ID deduplication. `telegram.subscriber_events` controls which event kinds are broadcast to all connected users.
