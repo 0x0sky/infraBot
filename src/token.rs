@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -20,7 +20,11 @@ pub struct IssuedToken {
     pub expires_at: u64,
 }
 
-pub fn issue_access_token(secret: &str, telegram_user_id: i64, ttl_seconds: u64) -> Result<IssuedToken> {
+pub fn issue_access_token(
+    secret: &str,
+    telegram_user_id: i64,
+    ttl_seconds: u64,
+) -> Result<IssuedToken> {
     let issued_at = unix_now();
     let expires_at = issued_at.saturating_add(ttl_seconds);
     let claims = Claims {
@@ -59,7 +63,8 @@ mod tests {
 
     #[test]
     fn issues_non_empty_token() {
-        let issued = issue_access_token(&"x".repeat(32), 42, 300).unwrap();
+        let secret = "x".repeat(32);
+        let issued = issue_access_token(&secret, 42, 300).unwrap();
         assert!(!issued.access_token.is_empty());
         assert!(issued.expires_at > unix_now());
     }
