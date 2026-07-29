@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::{collections::HashSet, env, net::SocketAddr};
 
 #[derive(Clone)]
@@ -44,7 +44,7 @@ impl Config {
         {
             bail!("TELEGRAM_WEBHOOK_SECRET must be 16-256 URL-safe characters");
         }
-        if signing_secret.as_bytes().len() < 32 {
+        if signing_secret.len() < 32 {
             bail!("INFRABOT_SIGNING_SECRET must contain at least 32 bytes");
         }
 
