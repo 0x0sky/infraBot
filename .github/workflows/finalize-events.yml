@@ -1,0 +1,120 @@
+name: finalize projected events
+
+on:
+  push:
+    branches:
+      - agent/secure-cli-pairing
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/secure-cli-pairing
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Add projected event field support
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/main.rs")
+          text = path.read_text()
+
+          old = 'use std::{collections::HashSet, sync::Arc, time::Duration};'
+          new = 'use std::{collections::{BTreeMap, HashSet}, sync::Arc, time::Duration};'
+          if old not in text:
+              raise SystemExit("std collections import not found")
+          text = text.replace(old, new, 1)
+
+          old = '''    status: Option<String>,
+              message: String,
+          }'''
+          new = '''    status: Option<String>,
+              message: String,
+              #[serde(default)]
+              fields: BTreeMap<String, String>,
+          }'''
+          if old not in text:
+              raise SystemExit("EventRequest fields not found")
+          text = text.replace(old, new, 1)
+
+          old = '''        && valid_text(&event.message, 4_000)
+          }'''
+          new = '''        && valid_text(&event.message, 4_000)
+              && event.fields.len() <= 24
+              && event
+                  .fields
+                  .iter()
+                  .all(|(name, value)| valid_token(name, 64) && valid_text(value, 512))
+              && event.fields.values().map(String::len).sum::<usize>() <= 4_096
+          }'''
+          if old not in text:
+              raise SystemExit("valid_event tail not found")
+          text = text.replace(old, new, 1)
+
+          old = '''    if let Some(service) = event.service.as_deref() {
+              lines.push(format!("service: {service}"));
+          }
+          if let Some(status) = event.status.as_deref() {
+              lines.push(format!("status: {status}"));
+          }
+          lines.push(String::new());'''
+          new = '''    if event.fields.is_empty() {
+              if let Some(service) = event.service.as_deref() {
+                  lines.push(format!("service: {service}"));
+              }
+              if let Some(status) = event.status.as_deref() {
+                  lines.push(format!("status: {status}"));
+              }
+          } else {
+              for (name, value) in &event.fields {
+                  lines.push(format!("{name}: {value}"));
+              }
+          }
+          lines.push(String::new());'''
+          if old not in text:
+              raise SystemExit("render_event projection block not found")
+          text = text.replace(old, new, 1)
+
+          old = '''            status: Some("unhealthy".into()),
+                  message: "health check failed".into(),
+              };'''
+          new = '''            status: Some("unhealthy".into()),
+                  message: "health check failed".into(),
+                  fields: BTreeMap::from([
+                      ("image".into(), "market:latest".into()),
+                      ("previous_status".into(), "healthy".into()),
+                  ]),
+              };'''
+          if old not in text:
+              raise SystemExit("event test fixture not found")
+          text = text.replace(old, new, 1)
+
+          old = '''        assert!(rendered.contains("source: primary"));'''
+          new = '''        assert!(rendered.contains("source: primary"));
+              assert!(rendered.contains("image: market:latest"));'''
+          if old not in text:
+              raise SystemExit("event render assertion not found")
+          text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          PY
+      - run: cargo fmt
+      - name: Commit projected event support
+        run: |
+          set -Eeuo pipefail
+          if git diff --quiet -- src/main.rs; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/main.rs
+          git commit -m "Render projected event fields"
+          git push origin HEAD:agent/secure-cli-pairing
