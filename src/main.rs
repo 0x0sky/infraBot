@@ -7,18 +7,18 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use config::Config;
+use config::{Config, RecipientConfig};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use store::{ApproveOutcome, CreateOutcome, ExchangeOutcome, PairingStore, decode_challenge};
 use subtle::ConstantTimeEq;
 use telegram::{TelegramUpdate, send_message, start_payload};
-use token::issue_access_token;
+use token::{issue_access_token, verify_access_token};
 use tokio::{net::TcpListener, sync::Mutex};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -66,6 +66,22 @@ struct TokenResponse {
     expires_at: u64,
     telegram_user_id: i64,
     source: String,
+}
+
+#[derive(Deserialize)]
+struct EventRequest {
+    kind: String,
+    project: String,
+    service: Option<String>,
+    status: Option<String>,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct DeliveryResponse {
+    source: String,
+    attempted: usize,
+    delivered: usize,
 }
 
 #[derive(Serialize)]
@@ -129,6 +145,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/v1/pairings", post(create_pairing))
         .route("/v1/pairings/:session_id/exchange", post(exchange_pairing))
+        .route("/v1/events", post(deliver_event))
         .route("/telegram/webhook", post(telegram_webhook))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .with_state(state);
@@ -239,6 +256,65 @@ async fn exchange_pairing(
     }
 }
 
+async fn deliver_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EventRequest>,
+) -> Response {
+    let Some(access_token) = bearer_token(&headers) else {
+        return api_error(StatusCode::UNAUTHORIZED, "missing_access_token");
+    };
+    let Ok(authorized) = verify_access_token(&state.config.signing_secret, access_token) else {
+        return api_error(StatusCode::UNAUTHORIZED, "invalid_access_token");
+    };
+    if !state.config.allowed_user_ids.contains(&authorized.telegram_user_id)
+        || !state.config.sources.contains_key(&authorized.source)
+    {
+        return api_error(StatusCode::FORBIDDEN, "source_not_authorized");
+    }
+    if !valid_event(&request) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_event");
+    }
+
+    let chat_ids = state
+        .config
+        .recipients
+        .iter()
+        .filter(|recipient| recipient_matches(recipient, &request.kind))
+        .map(|recipient| recipient.chat_id)
+        .collect::<HashSet<_>>();
+    let attempted = chat_ids.len();
+    let message = render_event(&authorized.source, &request);
+    let mut delivered = 0;
+    for chat_id in chat_ids {
+        if send_message(
+            &state.http,
+            &state.config.telegram_bot_token,
+            chat_id,
+            &message,
+        )
+        .await
+        {
+            delivered += 1;
+        } else {
+            warn!(source = %authorized.source, chat_id, "Telegram event delivery failed");
+        }
+    }
+
+    if attempted > 0 && delivered == 0 {
+        return api_error(StatusCode::BAD_GATEWAY, "telegram_delivery_failed");
+    }
+    (
+        StatusCode::OK,
+        Json(DeliveryResponse {
+            source: authorized.source,
+            attempted,
+            delivered,
+        }),
+    )
+        .into_response()
+}
+
 async fn telegram_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -301,6 +377,61 @@ async fn telegram_webhook(
     StatusCode::OK.into_response()
 }
 
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .filter(|value| !value.is_empty())
+}
+
+fn valid_event(event: &EventRequest) -> bool {
+    valid_token(&event.kind, 128)
+        && valid_text(&event.project, 128)
+        && event
+            .service
+            .as_deref()
+            .is_none_or(|value| valid_text(value, 128))
+        && event
+            .status
+            .as_deref()
+            .is_none_or(|value| valid_text(value, 64))
+        && valid_text(&event.message, 4_000)
+}
+
+fn valid_token(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+}
+
+fn valid_text(value: &str, maximum: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
+fn recipient_matches(recipient: &RecipientConfig, kind: &str) -> bool {
+    recipient.events.contains("*") || recipient.events.contains(kind)
+}
+
+fn render_event(source: &str, event: &EventRequest) -> String {
+    let mut lines = vec![
+        format!("{} · {}", event.kind, event.project),
+        format!("source: {source}"),
+    ];
+    if let Some(service) = event.service.as_deref() {
+        lines.push(format!("service: {service}"));
+    }
+    if let Some(status) = event.status.as_deref() {
+        lines.push(format!("status: {status}"));
+    }
+    lines.push(String::new());
+    lines.push(event.message.trim().to_owned());
+    lines.join("\n")
+}
+
 fn secure_eq(left: &str, right: &str) -> bool {
     left.len() == right.len() && bool::from(left.as_bytes().ct_eq(right.as_bytes()))
 }
@@ -318,5 +449,30 @@ mod tests {
         assert!(secure_eq("same-secret", "same-secret"));
         assert!(!secure_eq("same-secret", "other-secret"));
         assert!(!secure_eq("short", "longer"));
+    }
+
+    #[test]
+    fn validates_and_renders_events() {
+        let event = EventRequest {
+            kind: "service.failed".into(),
+            project: "market".into(),
+            service: Some("api".into()),
+            status: Some("unhealthy".into()),
+            message: "health check failed".into(),
+        };
+        assert!(valid_event(&event));
+        let rendered = render_event("primary", &event);
+        assert!(rendered.contains("service.failed · market"));
+        assert!(rendered.contains("source: primary"));
+    }
+
+    #[test]
+    fn wildcard_recipient_matches_every_event() {
+        let recipient = RecipientConfig {
+            id: "owner".into(),
+            chat_id: 42,
+            events: HashSet::from(["*".into()]),
+        };
+        assert!(recipient_matches(&recipient, "service.failed"));
     }
 }
