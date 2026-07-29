@@ -2,7 +2,7 @@
 
 Secure Telegram authorization and notification gateway for [`infraCLI`](https://github.com/0x0sky/infraCLI).
 
-`infraBot` keeps its routing contract in its own `.infra` file. The standard `project` block describes how infraCLI runs the API service; the application-owned `infrabot` block declares trusted CLI sources, Telegram recipients, event subscriptions, policy, and secret references.
+`infraBot` keeps its routing contract in its own `.infra` file. The standard `project` block describes how infraCLI runs the API service; the application-owned `infrabot` block declares trusted CLI sources, their addresses, Telegram recipients, event subscriptions, policy, and secret references.
 
 ## topology
 
@@ -52,11 +52,11 @@ infrabot {
     }
 
     source "primary" {
-        address = env("INFRA_PRIMARY_ADDRESS")
+        address = "https://primary.example"
     }
 
     source "secondary" {
-        address = env("INFRA_SECONDARY_ADDRESS")
+        address = "https://secondary.example"
     }
 
     recipient "owner" {
@@ -65,6 +65,8 @@ infrabot {
     }
 }
 ```
+
+Replace the example source URLs with the real API addresses of the authorized infraCLI hosts. Addresses, source IDs, recipients, event filters, and policy live directly in `.infra`; only secrets and Telegram identities are resolved from the environment.
 
 The registry is loaded and validated when the process starts. Changing a source, recipient, event filter, or policy requires an infraBot restart; the first version does not hot-reload configuration. Unknown blocks or fields, duplicate identifiers, missing environment references, literal secret values, insecure remote URLs, empty source sets, and empty recipient sets fail startup.
 
@@ -159,7 +161,7 @@ Before horizontal scaling, move pairing and future delivery state to a shared at
 
 ## environment
 
-Start from `.env.example`. It supplies values referenced by `.infra`, including:
+Start from `.env.example`. It supplies runtime values referenced by `.infra`:
 
 ```text
 INFRABOT_PUBLIC_URL
@@ -169,8 +171,6 @@ TELEGRAM_WEBHOOK_SECRET
 TELEGRAM_ALLOWED_USER_IDS
 TELEGRAM_CHAT_ID
 INFRABOT_SIGNING_SECRET
-INFRA_PRIMARY_ADDRESS
-INFRA_SECONDARY_ADDRESS
 ```
 
 `TELEGRAM_WEBHOOK_SECRET` must contain 16–256 URL-safe characters. `INFRABOT_SIGNING_SECRET` must contain at least 32 random bytes and must differ from the bot token and webhook secret. Rotating it invalidates issued tokens.
