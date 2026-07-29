@@ -18,6 +18,7 @@ Caddy strips `/infra` before forwarding requests to `infra-bot:8787`.
 - the `infra-bot:8787` workload contract;
 - Telegram pairing, source authorization, routing policy, and event delivery;
 - the host build of `infraCLI` installed with the release;
+- source-specific protected credential files;
 - local and internal health verification.
 
 `0x0sky/infra` owns:
@@ -34,6 +35,9 @@ The market repositories continue to own their existing application containers an
 /opt/infrabot/
 ├── bin/
 │   └── infra
+├── credentials/
+│   ├── 0xda-market.json
+│   └── 0xda-market-bot.json
 └── targets/
     └── vps-spaceship-01/
         ├── current -> releases/<sha>
@@ -48,6 +52,8 @@ The market repositories continue to own their existing application containers an
 ```
 
 The workflow retains the three newest activated infraBot releases. `infraCLI` is built in GitHub Actions from the selected repository ref and installed atomically at `/opt/infrabot/bin/infra` only after infraBot activation succeeds.
+
+`/opt/infrabot/credentials` is created with mode `0700`. Each logical CLI source uses a separate credential file, preventing a second pairing on the same VPS from replacing the first source's token. infraCLI writes each credential atomically with mode `0600`.
 
 ## GitHub Environment
 
@@ -114,13 +120,15 @@ chmod 0600 /opt/infrabot/targets/vps-spaceship-01/shared/.env
    https://0xda-market.nilx.one/infra/telegram/webhook
    ```
 
-8. Authorize both declared sources:
+8. Authorize both declared sources with independent credential paths:
 
    ```bash
+   INFRA_CREDENTIALS_FILE=/opt/infrabot/credentials/0xda-market.json \
    /opt/infrabot/bin/infra auth telegram \
      --endpoint https://0xda-market.nilx.one/infra \
      --source 0xda-market
 
+   INFRA_CREDENTIALS_FILE=/opt/infrabot/credentials/0xda-market-bot.json \
    /opt/infrabot/bin/infra auth telegram \
      --endpoint https://0xda-market.nilx.one/infra \
      --source 0xda-market-bot \
@@ -129,8 +137,9 @@ chmod 0600 /opt/infrabot/targets/vps-spaceship-01/shared/.env
 
 ## Safety
 
-- `validate` builds and validates a release without changing the active container or host binary.
-- `activate` requires the exact confirmation token `activate-infrabot`.
+- `validate` builds and validates a release without changing the active container or host binary;
+- `activate` requires the exact confirmation token `activate-infrabot`;
 - failed activation attempts to restore the previous infraBot release;
 - the workflow never changes DNS, Caddy, market services, databases, or Telegram webhook state;
-- public activation of `/infra/*` must happen only after `infra-bot:8787` is healthy on `nilx-edge`.
+- public activation of `/infra/*` must happen only after `infra-bot:8787` is healthy on `nilx-edge`;
+- credentials are source-specific and never committed to Git.
