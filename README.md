@@ -2,99 +2,178 @@
 
 Secure Telegram authorization and notification gateway for [`infraCLI`](https://github.com/0x0sky/infraCLI).
 
-The first implementation provides a fast one-tap pairing flow between the CLI and an allowlisted Telegram account. Notification delivery and operator commands remain separate follow-up capabilities.
+`infraBot` keeps its routing contract in its own `.infra` file. The standard `project` block describes how infraCLI runs the API service; the application-owned `infrabot` block declares trusted CLI sources, Telegram recipients, event subscriptions, policy, and secret references.
 
-## authorization topology
+## topology
 
-One infraBot deployment and one Telegram bot may authorize multiple independent infraCLI installations:
+One infraBot deployment and one Telegram bot may authorize multiple independent infraCLI sources:
 
 ```text
-infraCLI · host-a ─┐
-                   ├──► infraBot ───► one Telegram bot/account
-infraCLI · host-b ─┘
+infraCLI · primary ─┐
+                    ├──► infraBot API ───► one Telegram bot
+infraCLI · secondary┘             │
+                                  └──► configured recipients
 ```
 
-Every CLI creates its own pairing session, verifier, and token exchange. Sessions are keyed independently, issued tokens have unique IDs, and credentials remain local to each CLI host. Authorizing a second CLI does not overwrite or revoke the first CLI.
+Every source has an independent pairing session, verifier, source-bound access token, and local credential file. Authorizing `secondary` does not overwrite or revoke `primary`.
 
-The current contract identifies authorization by Telegram account and pairing session. A persistent installation identity is deliberately deferred until infraBot adds per-device listing and revocation; it is not required for safely connecting multiple CLI instances.
+## `.infra` registry
+
+```text
+infra 1
+
+project "infrabot" {
+    runtime = "docker"
+
+    service "api" {
+        source = "."
+        build = "Dockerfile"
+        expose = 8787
+        health = "/health"
+        environment = ".env"
+    }
+}
+
+infrabot {
+    bind = "0.0.0.0:8787"
+    public_url = env("INFRABOT_PUBLIC_URL")
+    pairing_ttl_seconds = 300
+    access_token_ttl_seconds = 2592000
+    poll_interval_seconds = 2
+    max_active_pairings = 1000
+    max_exchange_attempts = 20
+
+    telegram {
+        bot_username = env("TELEGRAM_BOT_USERNAME")
+        bot_token = env("TELEGRAM_BOT_TOKEN")
+        webhook_secret = env("TELEGRAM_WEBHOOK_SECRET")
+        signing_secret = env("INFRABOT_SIGNING_SECRET")
+        allowed_user_ids = env("TELEGRAM_ALLOWED_USER_IDS")
+    }
+
+    source "primary" {
+        address = env("INFRA_PRIMARY_ADDRESS")
+    }
+
+    source "secondary" {
+        address = env("INFRA_SECONDARY_ADDRESS")
+    }
+
+    recipient "owner" {
+        chat_id = env("TELEGRAM_CHAT_ID")
+        events = ["*"]
+    }
+}
+```
+
+The registry is loaded and validated when the process starts. Unknown blocks or fields, duplicate identifiers, missing environment references, literal secret values, insecure remote URLs, empty source sets, and empty recipient sets fail startup.
+
+`source.address` is routing metadata for future outbound operator commands. It does not authenticate inbound traffic. Inbound events are trusted only after verification of a signed token bound to the declared source ID.
+
+Recipient event lists accept exact event kinds such as `service.failed` and `service.recovered`. `"*"` subscribes a recipient to every event. Multiple matching recipients with the same Telegram chat ID are deduplicated for each delivery.
 
 ## authorization flow
 
 ```text
 infraCLI                         infraBot                         Telegram
    │                                │                                │
-   ├─ create verifier + challenge ─►│                                │
+   ├─ source + verifier challenge ─►│                                │
    │◄─ session + one-time deep link ┤                                │
    ├─ open deep link ───────────────────────────────────────────────►│
-   │                                │◄─ signed webhook /start token ─┤
-   │                                ├─ allowlist + session approval   │
+   │                                │◄─ verified private /start ─────┤
+   │                                ├─ allowlist + source approval   │
    ├─ exchange session + verifier ─►│                                │
-   │◄─ scoped access token ─────────┤                                │
+   │◄─ source-bound access token ───┤                                │
 ```
 
-The CLI private verifier never leaves the device until token exchange. infraBot stores only its SHA-256 challenge. The Telegram deep link contains a separate random, five-minute, one-time secret and never contains the access token or verifier.
+The private verifier never appears in the Telegram deep link. Pairing state is short-lived and in memory; the issued token contains the approved Telegram user, source ID, `events:write` scope, unique token ID, and expiry.
+
+Authorize each source separately:
+
+```bash
+infra auth telegram \
+  --endpoint https://<infrabot-host> \
+  --source primary
+
+infra auth telegram \
+  --endpoint https://<infrabot-host> \
+  --source secondary \
+  --no-open
+```
+
+A source must already exist in infraBot's `.infra` registry. `INFRABOT_URL` and `INFRA_SOURCE` may replace the corresponding flags.
+
+## event delivery
+
+Authenticated sources submit normalized events to:
+
+```text
+POST /v1/events
+Authorization: Bearer <source-bound-token>
+Content-Type: application/json
+```
+
+Example body:
+
+```json
+{
+  "kind": "service.failed",
+  "project": "market",
+  "service": "api",
+  "status": "unhealthy",
+  "message": "health check failed"
+}
+```
+
+infraBot verifies the signature, issuer, audience, expiry, `events:write` scope, Telegram allowlist membership, and source registry membership. It then applies recipient filters, deduplicates chat IDs, renders the event, and calls Telegram `sendMessage`.
+
+The current delivery path is synchronous. It reports attempted and successful recipient counts but does not yet provide a durable queue, retry schedule, delivery history, or cross-restart deduplication. Those belong to the notification-state layer described in the infraCLI architecture proposal.
 
 ## security contract
 
-- only Telegram user IDs listed in `TELEGRAM_ALLOWED_USER_IDS` may approve pairing;
+- only Telegram users declared by `telegram.allowed_user_ids` may approve or keep using source tokens;
 - approval is accepted only from a private Telegram chat;
 - Telegram webhooks require `X-Telegram-Bot-Api-Secret-Token`;
 - pairing links expire and are single-use;
-- verifier comparison is constant-time and exchange attempts are bounded;
-- repeated polling is throttled per pairing session;
-- the access token is scoped and signed with an independent secret;
+- verifier and webhook-secret comparisons are constant-time;
+- exchange attempts, polling rate, active sessions, and request bodies are bounded;
+- tokens are signed with an independent secret and bound to one source;
 - bot token, webhook secret, signing secret, verifier, and access token are never logged;
-- production traffic must terminate TLS before reaching infraBot;
-- active pairing capacity is bounded to limit unauthenticated resource consumption.
-
-`TELEGRAM_ALLOWED_USER_IDS` is mandatory. This is not an open Telegram login service.
+- secret fields must use `env("NAME")`; committed literal secrets are rejected;
+- public and source URLs require HTTPS, except localhost development;
+- source addresses are never treated as proof of identity.
 
 ## API
 
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | process health |
-| `POST /v1/pairings` | create a PKCE-style pairing session |
-| `POST /v1/pairings/:id/exchange` | poll and exchange an approved session |
+| `POST /v1/pairings` | create a source-bound PKCE-style pairing session |
+| `POST /v1/pairings/:id/exchange` | exchange an approved session for a token |
+| `POST /v1/events` | deliver an authenticated source event to matching recipients |
 | `POST /telegram/webhook` | receive verified Telegram updates |
 
-Pairing state is intentionally in-memory for the first single-replica deployment. Restarting infraBot invalidates only pending five-minute sessions. Issued access tokens remain independently verifiable through `INFRABOT_SIGNING_SECRET`.
+Pending pairing state is intentionally in memory for the first single-replica deployment. Restarting infraBot invalidates pending sessions. Existing signed access tokens remain verifiable, but removing a source or Telegram user from `.infra` blocks that token at event submission time.
 
-Before horizontal scaling, replace the in-memory store with a shared atomic store and preserve the same pairing contract.
+Before horizontal scaling, move pairing and future delivery state to a shared atomic store while preserving the API contract.
 
-## configuration
+## environment
 
-Start from `.env.example`.
-
-Required variables:
+Start from `.env.example`. It supplies values referenced by `.infra`, including:
 
 ```text
+INFRABOT_PUBLIC_URL
 TELEGRAM_BOT_TOKEN
 TELEGRAM_BOT_USERNAME
 TELEGRAM_WEBHOOK_SECRET
 TELEGRAM_ALLOWED_USER_IDS
+TELEGRAM_CHAT_ID
 INFRABOT_SIGNING_SECRET
+INFRA_PRIMARY_ADDRESS
+INFRA_SECONDARY_ADDRESS
 ```
 
-`TELEGRAM_ALLOWED_USER_IDS` is a comma-separated list of numeric Telegram user IDs.
-
-`TELEGRAM_WEBHOOK_SECRET` must contain 16–256 URL-safe characters. Configure Telegram to send it as the webhook secret token for:
-
-```text
-https://<infrabot-host>/telegram/webhook
-```
-
-`INFRABOT_SIGNING_SECRET` must contain at least 32 random bytes and must be different from the Telegram bot token and webhook secret. Rotating it invalidates all issued access tokens.
-
-Optional policy variables:
-
-```text
-PAIRING_TTL_SECONDS=300
-PAIRING_POLL_INTERVAL_SECONDS=2
-ACCESS_TOKEN_TTL_SECONDS=2592000
-MAX_ACTIVE_PAIRINGS=1000
-MAX_EXCHANGE_ATTEMPTS=20
-```
+`TELEGRAM_WEBHOOK_SECRET` must contain 16–256 URL-safe characters. `INFRABOT_SIGNING_SECRET` must contain at least 32 random bytes and must differ from the bot token and webhook secret. Rotating it invalidates issued tokens.
 
 ## run
 
@@ -102,19 +181,15 @@ MAX_EXCHANGE_ATTEMPTS=20
 cargo run
 ```
 
-The service listens on `0.0.0.0:8787` by default. Put it behind the shared HTTPS edge and apply request-rate limiting to `POST /v1/pairings` at that edge.
+Local execution reads `./.infra` by default. Set `INFRABOT_CONFIG` to load another path.
 
-Then authorize from every infraCLI host independently:
+Configure Telegram's webhook as:
 
-```bash
-# host-a
-infra auth telegram --endpoint https://<infrabot-host>
-
-# host-b
-infra auth telegram --endpoint https://<infrabot-host> --no-open
+```text
+https://<infrabot-host>/telegram/webhook
 ```
 
-Both commands target the same infraBot URL and the same Telegram bot. Each Telegram approval completes only the matching one-time pairing session.
+Put the service behind HTTPS and rate-limit `POST /v1/pairings` and `POST /v1/events` at the edge.
 
 ## container
 
@@ -123,7 +198,9 @@ docker build -t infrabot:local .
 docker run --rm --env-file .env -p 8787:8787 infrabot:local
 ```
 
-Run the container as a single replica until pairing state moves to a shared store.
+The image contains the repository `.infra` at `/etc/infrabot/.infra`. Changing the baked registry requires a rebuild and restart. A mounted file may be used instead by overriding `INFRABOT_CONFIG`.
+
+Run one replica until pairing state moves to a shared store.
 
 ## development
 
