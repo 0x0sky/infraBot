@@ -34,7 +34,7 @@ pub fn issue_access_token(
         jti: Uuid::new_v4().to_string(),
         iat: issued_at,
         exp: expires_at,
-        scope: "events:write profile:read",
+        scope: "events:write",
     };
     let header = Header::new(Algorithm::HS256);
     let access_token = encode(
