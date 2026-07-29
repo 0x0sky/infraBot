@@ -20,6 +20,7 @@ pub struct PairingStore {
 }
 
 struct PairingSession {
+    source: String,
     code_challenge: [u8; 32],
     start_token_digest: [u8; 32],
     expires_at: u64,
@@ -45,8 +46,8 @@ pub enum CreateOutcome {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApproveOutcome {
-    Approved,
-    AlreadyApproved,
+    Approved(String),
+    AlreadyApproved(String),
     DifferentUser,
     Expired,
     Consumed,
@@ -57,7 +58,10 @@ pub enum ApproveOutcome {
 pub enum ExchangeOutcome {
     Pending,
     SlowDown,
-    Approved(i64),
+    Approved {
+        telegram_user_id: i64,
+        source: String,
+    },
     InvalidVerifier,
     TooManyAttempts,
     Expired,
@@ -82,7 +86,7 @@ impl PairingStore {
         }
     }
 
-    pub fn create(&mut self, code_challenge: [u8; 32]) -> CreateOutcome {
+    pub fn create(&mut self, source: String, code_challenge: [u8; 32]) -> CreateOutcome {
         self.remove_expired();
         if self.sessions.len() >= self.max_active_pairings {
             return CreateOutcome::CapacityExceeded;
@@ -96,6 +100,7 @@ impl PairingStore {
         self.sessions.insert(
             session_id,
             PairingSession {
+                source,
                 code_challenge,
                 start_token_digest,
                 expires_at,
@@ -141,9 +146,11 @@ impl PairingStore {
         match session.approved_user_id {
             None => {
                 session.approved_user_id = Some(user_id);
-                ApproveOutcome::Approved
+                ApproveOutcome::Approved(session.source.clone())
             }
-            Some(existing) if existing == user_id => ApproveOutcome::AlreadyApproved,
+            Some(existing) if existing == user_id => {
+                ApproveOutcome::AlreadyApproved(session.source.clone())
+            }
             Some(_) => ApproveOutcome::DifferentUser,
         }
     }
@@ -181,12 +188,15 @@ impl PairingStore {
             return ExchangeOutcome::InvalidVerifier;
         }
 
-        let Some(user_id) = session.approved_user_id else {
+        let Some(telegram_user_id) = session.approved_user_id else {
             return ExchangeOutcome::Pending;
         };
         session.consumed = true;
         self.start_index.remove(&session.start_token_digest);
-        ExchangeOutcome::Approved(user_id)
+        ExchangeOutcome::Approved {
+            telegram_user_id,
+            source: session.source.clone(),
+        }
     }
 
     fn remove_expired(&mut self) {
@@ -233,7 +243,7 @@ mod tests {
     fn exchanges_only_after_approval() {
         let (verifier, challenge) = verifier_and_challenge();
         let mut store = PairingStore::new(300, 0, 10, 5);
-        let CreateOutcome::Created(created) = store.create(challenge) else {
+        let CreateOutcome::Created(created) = store.create("primary".into(), challenge) else {
             panic!("pairing was not created");
         };
 
@@ -243,11 +253,14 @@ mod tests {
         );
         assert_eq!(
             store.approve(&created.start_token, 42),
-            ApproveOutcome::Approved
+            ApproveOutcome::Approved("primary".into())
         );
         assert_eq!(
             store.exchange(created.session_id, &verifier),
-            ExchangeOutcome::Approved(42)
+            ExchangeOutcome::Approved {
+                telegram_user_id: 42,
+                source: "primary".into(),
+            }
         );
         assert_eq!(
             store.exchange(created.session_id, &verifier),
@@ -256,10 +269,40 @@ mod tests {
     }
 
     #[test]
+    fn independent_sources_do_not_replace_each_other() {
+        let (first_verifier, first_challenge) = verifier_and_challenge();
+        let (second_verifier, second_challenge) = verifier_and_challenge();
+        let mut store = PairingStore::new(300, 0, 10, 5);
+        let CreateOutcome::Created(first) = store.create("primary".into(), first_challenge) else {
+            panic!("first pairing was not created");
+        };
+        let CreateOutcome::Created(second) = store.create("secondary".into(), second_challenge) else {
+            panic!("second pairing was not created");
+        };
+
+        assert!(matches!(
+            store.approve(&first.start_token, 42),
+            ApproveOutcome::Approved(source) if source == "primary"
+        ));
+        assert!(matches!(
+            store.approve(&second.start_token, 42),
+            ApproveOutcome::Approved(source) if source == "secondary"
+        ));
+        assert!(matches!(
+            store.exchange(first.session_id, &first_verifier),
+            ExchangeOutcome::Approved { source, .. } if source == "primary"
+        ));
+        assert!(matches!(
+            store.exchange(second.session_id, &second_verifier),
+            ExchangeOutcome::Approved { source, .. } if source == "secondary"
+        ));
+    }
+
+    #[test]
     fn rejects_wrong_verifier() {
         let (_, challenge) = verifier_and_challenge();
         let mut store = PairingStore::new(300, 0, 10, 5);
-        let CreateOutcome::Created(created) = store.create(challenge) else {
+        let CreateOutcome::Created(created) = store.create("primary".into(), challenge) else {
             panic!("pairing was not created");
         };
 
