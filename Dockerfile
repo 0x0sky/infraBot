@@ -1,7 +1,7 @@
 FROM rust:1.85-bookworm AS build
 WORKDIR /app
 COPY . .
-RUN cargo build --release --locked
+RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update \
