@@ -30,9 +30,15 @@ jobs:
 
   deployment:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout companion infraCLI agent
+        uses: actions/checkout@v4
+        with:
+          repository: 0x0sky/infraCLI
+          ref: agent/containerized-service-monitor
+          path: deploy/vps/infraCLI-src
       - name: Validate shell contracts
         run: |
           bash -n deploy/vps/deploy.sh deploy/vps/verify.sh
@@ -44,5 +50,9 @@ jobs:
             --file deploy/vps/compose.yaml \
             --env-file deploy/vps/.env \
             config --quiet
-      - name: Build runtime image
-        run: docker build --tag infrabot:ci .
+      - name: Build runtime images
+        run: |
+          docker compose \
+            --file deploy/vps/compose.yaml \
+            --env-file deploy/vps/.env \
+            build infrabot infra-agent
