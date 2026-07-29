@@ -1,0 +1,44 @@
+infra 1
+
+project "infrabot" {
+    runtime = "docker"
+
+    service "api" {
+        source = "."
+        build = "Dockerfile"
+        expose = 8787
+        health = "/health"
+        environment = ".env"
+    }
+}
+
+infrabot {
+    bind = "0.0.0.0:8787"
+    public_url = env("INFRABOT_PUBLIC_URL")
+    pairing_ttl_seconds = 300
+    access_token_ttl_seconds = 2592000
+    poll_interval_seconds = 2
+    max_active_pairings = 1000
+    max_exchange_attempts = 20
+
+    telegram {
+        bot_username = env("TELEGRAM_BOT_USERNAME")
+        bot_token = env("TELEGRAM_BOT_TOKEN")
+        webhook_secret = env("TELEGRAM_WEBHOOK_SECRET")
+        signing_secret = env("INFRABOT_SIGNING_SECRET")
+        allowed_user_ids = env("TELEGRAM_ALLOWED_USER_IDS")
+    }
+
+    source "primary" {
+        address = "https://primary.example"
+    }
+
+    source "secondary" {
+        address = "https://secondary.example"
+    }
+
+    recipient "owner" {
+        chat_id = env("TELEGRAM_CHAT_ID")
+        events = ["*"]
+    }
+}
