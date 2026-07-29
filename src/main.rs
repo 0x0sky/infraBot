@@ -14,7 +14,11 @@ use axum::{
 use config::{Config, RecipientConfig};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use store::{ApproveOutcome, CreateOutcome, ExchangeOutcome, PairingStore, decode_challenge};
 use subtle::ConstantTimeEq;
 use telegram::{TelegramUpdate, send_message, start_payload};
@@ -75,6 +79,8 @@ struct EventRequest {
     service: Option<String>,
     status: Option<String>,
     message: String,
+    #[serde(default)]
+    fields: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -401,6 +407,12 @@ fn valid_event(event: &EventRequest) -> bool {
             .as_deref()
             .is_none_or(|value| valid_text(value, 64))
         && valid_text(&event.message, 4_000)
+        && event.fields.len() <= 24
+        && event
+            .fields
+            .iter()
+            .all(|(name, value)| valid_token(name, 64) && valid_text(value, 512))
+        && event.fields.values().map(String::len).sum::<usize>() <= 4_096
 }
 
 fn valid_token(value: &str, maximum: usize) -> bool {
@@ -424,15 +436,24 @@ fn render_event(source: &str, event: &EventRequest) -> String {
         format!("{} · {}", event.kind, event.project),
         format!("source: {source}"),
     ];
-    if let Some(service) = event.service.as_deref() {
-        lines.push(format!("service: {service}"));
-    }
-    if let Some(status) = event.status.as_deref() {
-        lines.push(format!("status: {status}"));
+    if event.fields.is_empty() {
+        if let Some(service) = event.service.as_deref() {
+            lines.push(format!("service: {service}"));
+        }
+        if let Some(status) = event.status.as_deref() {
+            lines.push(format!("status: {status}"));
+        }
+    } else {
+        for (name, value) in &event.fields {
+            lines.push(format!("{name}: {value}"));
+        }
     }
     lines.push(String::new());
     lines.push(event.message.trim().to_owned());
-    lines.join("\n")
+    lines.join(
+        "
+",
+    )
 }
 
 fn secure_eq(left: &str, right: &str) -> bool {
@@ -462,11 +483,16 @@ mod tests {
             service: Some("api".into()),
             status: Some("unhealthy".into()),
             message: "health check failed".into(),
+            fields: BTreeMap::from([
+                ("image".into(), "market:latest".into()),
+                ("previous_status".into(), "healthy".into()),
+            ]),
         };
         assert!(valid_event(&event));
         let rendered = render_event("primary", &event);
         assert!(rendered.contains("service.failed · market"));
         assert!(rendered.contains("source: primary"));
+        assert!(rendered.contains("image: market:latest"));
     }
 
     #[test]
