@@ -17,7 +17,7 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,3 +27,22 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+
+  deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shell contracts
+        run: |
+          bash -n deploy/vps/deploy.sh deploy/vps/verify.sh
+          shellcheck deploy/vps/deploy.sh deploy/vps/verify.sh
+      - name: Validate Compose contract
+        run: |
+          cp deploy/vps/env.example deploy/vps/.env
+          docker compose \
+            --file deploy/vps/compose.yaml \
+            --env-file deploy/vps/.env \
+            config --quiet
+      - name: Build runtime image
+        run: docker build --tag infrabot:ci .
