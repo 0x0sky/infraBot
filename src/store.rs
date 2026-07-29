@@ -276,7 +276,8 @@ mod tests {
         let CreateOutcome::Created(first) = store.create("primary".into(), first_challenge) else {
             panic!("first pairing was not created");
         };
-        let CreateOutcome::Created(second) = store.create("secondary".into(), second_challenge) else {
+        let CreateOutcome::Created(second) = store.create("secondary".into(), second_challenge)
+        else {
             panic!("second pairing was not created");
         };
 
