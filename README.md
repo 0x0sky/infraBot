@@ -66,7 +66,7 @@ infrabot {
 }
 ```
 
-The registry is loaded and validated when the process starts. Unknown blocks or fields, duplicate identifiers, missing environment references, literal secret values, insecure remote URLs, empty source sets, and empty recipient sets fail startup.
+The registry is loaded and validated when the process starts. Changing a source, recipient, event filter, or policy requires an infraBot restart; the first version does not hot-reload configuration. Unknown blocks or fields, duplicate identifiers, missing environment references, literal secret values, insecure remote URLs, empty source sets, and empty recipient sets fail startup.
 
 `source.address` is routing metadata for future outbound operator commands. It does not authenticate inbound traffic. Inbound events are trusted only after verification of a signed token bound to the declared source ID.
 
