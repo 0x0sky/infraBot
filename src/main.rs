@@ -14,7 +14,7 @@ use axum::{
 use config::Config;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use store::{ApproveOutcome, CreateOutcome, ExchangeOutcome, PairingStore, decode_challenge};
 use subtle::ConstantTimeEq;
 use telegram::{TelegramUpdate, send_message, start_payload};
@@ -38,6 +38,7 @@ struct CreatePairingRequest {
     code_challenge: String,
     client: String,
     client_version: String,
+    source: String,
 }
 
 #[derive(Serialize)]
@@ -64,6 +65,7 @@ struct TokenResponse {
     token_type: &'static str,
     expires_at: u64,
     telegram_user_id: i64,
+    source: String,
 }
 
 #[derive(Serialize)]
@@ -79,7 +81,33 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config = Arc::new(Config::from_env()?);
+    let config = Arc::new(Config::load()?);
+    let route_count = config
+        .recipients
+        .iter()
+        .map(|recipient| recipient.events.len())
+        .sum::<usize>();
+    let chat_count = config
+        .recipients
+        .iter()
+        .map(|recipient| recipient.chat_id)
+        .collect::<HashSet<_>>()
+        .len();
+    let recipient_names = config
+        .recipients
+        .iter()
+        .map(|recipient| recipient.id.as_str())
+        .collect::<Vec<_>>();
+    info!(
+        public_url = %config.public_url,
+        sources = config.sources.len(),
+        recipients = config.recipients.len(),
+        chats = chat_count,
+        routes = route_count,
+        recipient_names = ?recipient_names,
+        "infraBot configuration loaded"
+    );
+
     let store = PairingStore::new(
         config.pairing_ttl_seconds,
         config.poll_interval_seconds,
@@ -127,13 +155,16 @@ async fn create_pairing(
     {
         return api_error(StatusCode::BAD_REQUEST, "invalid_client");
     }
+    if !state.config.sources.contains_key(&request.source) {
+        return api_error(StatusCode::FORBIDDEN, "unknown_source");
+    }
     let Some(code_challenge) = decode_challenge(&request.code_challenge) else {
         return api_error(StatusCode::BAD_REQUEST, "invalid_code_challenge");
     };
 
     let created = {
         let mut store = state.store.lock().await;
-        store.create(code_challenge)
+        store.create(request.source, code_challenge)
     };
     let CreateOutcome::Created(created) = created else {
         return api_error(StatusCode::SERVICE_UNAVAILABLE, "pairing_capacity_exceeded");
@@ -179,10 +210,14 @@ async fn exchange_pairing(
         )
             .into_response(),
         ExchangeOutcome::SlowDown => api_error(StatusCode::TOO_MANY_REQUESTS, "slow_down"),
-        ExchangeOutcome::Approved(telegram_user_id) => {
+        ExchangeOutcome::Approved {
+            telegram_user_id,
+            source,
+        } => {
             match issue_access_token(
                 &state.config.signing_secret,
                 telegram_user_id,
+                &source,
                 state.config.access_token_ttl_seconds,
             ) {
                 Ok(token) => Json(TokenResponse {
@@ -190,6 +225,7 @@ async fn exchange_pairing(
                     token_type: "Bearer",
                     expires_at: token.expires_at,
                     telegram_user_id,
+                    source,
                 })
                 .into_response(),
                 Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "token_issue_failed"),
@@ -233,19 +269,21 @@ async fn telegram_webhook(
     };
 
     let reply = if !state.config.allowed_user_ids.contains(&user.id) {
-        "this Telegram account is not authorized for infraCLI"
+        "this Telegram account is not authorized for infraCLI".to_owned()
     } else {
         let outcome = {
             let mut store = state.store.lock().await;
             store.approve(payload, user.id)
         };
         match outcome {
-            ApproveOutcome::Approved | ApproveOutcome::AlreadyApproved => {
-                "infraCLI authorized. return to the terminal"
+            ApproveOutcome::Approved(source) | ApproveOutcome::AlreadyApproved(source) => {
+                format!("infraCLI source {source} authorized. return to the terminal")
             }
-            ApproveOutcome::DifferentUser => "this pairing belongs to another Telegram account",
+            ApproveOutcome::DifferentUser => {
+                "this pairing belongs to another Telegram account".to_owned()
+            }
             ApproveOutcome::Expired | ApproveOutcome::Consumed | ApproveOutcome::NotFound => {
-                "pairing expired or already used. run infra auth again"
+                "pairing expired or already used. run infra auth again".to_owned()
             }
         }
     };
@@ -254,7 +292,7 @@ async fn telegram_webhook(
         &state.http,
         &state.config.telegram_bot_token,
         message.chat.id,
-        reply,
+        &reply,
     )
     .await
     {
