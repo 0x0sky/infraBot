@@ -9,9 +9,9 @@ The first implementation provides a fast one-tap pairing flow between the CLI an
 One infraBot deployment and one Telegram bot may authorize multiple independent infraCLI installations:
 
 ```text
-infraCLI · laptop ─┐
+infraCLI · host-a ─┐
                    ├──► infraBot ───► one Telegram bot/account
-infraCLI · vps-01 ─┘
+infraCLI · host-b ─┘
 ```
 
 Every CLI creates its own pairing session, verifier, and token exchange. Sessions are keyed independently, issued tokens have unique IDs, and credentials remain local to each CLI host. Authorizing a second CLI does not overwrite or revoke the first CLI.
@@ -107,10 +107,10 @@ The service listens on `0.0.0.0:8787` by default. Put it behind the shared HTTPS
 Then authorize from every infraCLI host independently:
 
 ```bash
-# laptop
+# host-a
 infra auth telegram --endpoint https://<infrabot-host>
 
-# vps-01
+# host-b
 infra auth telegram --endpoint https://<infrabot-host> --no-open
 ```
 
