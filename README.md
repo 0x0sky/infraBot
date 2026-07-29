@@ -4,6 +4,18 @@ Secure Telegram authorization and notification gateway for [`infraCLI`](https://
 
 The first implementation provides a fast one-tap pairing flow between the CLI and an allowlisted Telegram account. Notification delivery and operator commands remain separate follow-up capabilities.
 
+## authorization topology
+
+One infraBot deployment and one Telegram bot may authorize multiple independent infraCLI installations:
+
+```text
+infraCLI · laptop ─┐
+                   ├──► infraBot ───► one Telegram bot/account
+infraCLI · vps-01 ─┘
+```
+
+Every CLI creates its own pairing session, verifier, and token exchange. Sessions are keyed independently, issued tokens have unique IDs, and credentials remain local to each CLI host. Authorizing a second CLI does not overwrite or revoke the first CLI.
+
 ## authorization flow
 
 ```text
@@ -90,11 +102,13 @@ cargo run
 
 The service listens on `0.0.0.0:8787` by default. Put it behind the shared HTTPS edge and apply request-rate limiting to `POST /v1/pairings` at that edge.
 
-Then authorize from infraCLI:
+Then authorize from every infraCLI host independently:
 
 ```bash
 infra auth telegram --endpoint https://<infrabot-host>
 ```
+
+Both commands may target the same infraBot URL and the same Telegram bot.
 
 ## container
 
