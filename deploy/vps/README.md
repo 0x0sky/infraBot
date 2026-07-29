@@ -1,43 +1,103 @@
 # VPS deployment
 
-`infraBot` runs on `vps-spaceship-01` beside the existing `0xda-market` and `0xda-market-bot` workloads. It is an independent Compose project and joins the shared external `nilx-edge` network through the stable alias `infra-bot`.
+`infraBot` and the `infra` service monitor run as independent containers on `vps-spaceship-01`, beside the existing `0xda-market` and `0xda-market-bot` workloads.
 
-The public edge remains owned by `0x0sky/infra`. It exposes infraBot at:
+```text
+Docker daemon
+   │
+   ▼
+docker-api · restricted read proxy
+   │ input
+   ▼
+infra-agent · .infra adapters
+   │ output
+   ▼
+infra-bot:8787
+   │
+   ▼
+@infra_services_bot
+```
+
+The public edge remains owned by `0x0sky/infra` and exposes:
 
 ```text
 https://0xda-market.nilx.one/infra/*
 ```
 
-Caddy strips `/infra` before forwarding requests to `infra-bot:8787`.
+Caddy strips `/infra` before forwarding to `infra-bot:8787`.
 
 ## Ownership
 
 `0x0sky/infraBot` owns:
 
-- the infraBot image and release lifecycle;
+- the infraBot API image and release lifecycle;
 - the `infra-bot:8787` workload contract;
-- Telegram pairing, source authorization, routing policy, and event delivery;
-- the host build of `infraCLI` installed with the release;
-- source-specific protected credential files;
-- local and internal health verification.
+- the containerized infra-agent image built from a selected `0x0sky/infraCLI` ref;
+- the private Docker API input proxy;
+- the `input/output` adapter configuration in `infra-agent.infra`;
+- Telegram pairing, source authorization, routing, and event delivery.
 
-`0x0sky/infra` owns:
+`0x0sky/infra` owns Caddy, public ports `80/443`, `nilx-edge`, `/infra/*` routing, and public HTTPS verification.
 
-- Caddy and public ports `80/443`;
-- the `nilx-edge` network contract;
-- `/infra/*` routing and public HTTPS verification.
+The market repositories remain the sole owners of their application containers and environments. This deployment reads their state but never rebuilds, restarts, stops, or switches them.
 
-The market repositories continue to own their existing application containers and deployment environments. infraBot deployment never rebuilds, restarts, or switches them.
+## Compose topology
+
+```text
+zero-x-infrabot-vps-spaceship-01
+├── infrabot
+│   ├── edge alias: infra-bot
+│   └── loopback: 127.0.0.1:8787
+├── docker-api
+│   ├── raw Docker socket is mounted only here
+│   ├── GET container API only
+│   └── private monitor network only
+├── infra-agent
+│   ├── no Docker socket
+│   ├── input: http://docker-api:2375
+│   ├── output: http://infra-bot:8787
+│   ├── state volume: /var/lib/infra
+│   └── loopback health: 127.0.0.1:9090
+└── infra-auth · one-off tools profile
+```
+
+The socket proxy is pinned to `ghcr.io/tecnativa/docker-socket-proxy:0.4.2`. Only `CONTAINERS=1` is enabled and mutating `POST` requests are disabled. The proxy is never attached to `nilx-edge` or a host port.
+
+## `.infra` agent contract
+
+`deploy/vps/infra-agent.infra` declares one Docker input and one infraBot output:
+
+```text
+input "market-docker" {
+    driver = "docker"
+    addresses = ["http://docker-api:2375"]
+    projects = [
+        "zero-x-da-market-development",
+        "zero-x-da-market-bot-development",
+        "zero-x-infrabot-vps-spaceship-01"
+    ]
+    services = []
+    fields = ["input", "docker_address", "container", "container_id", "project", "service", "image", "state", "health"]
+}
+
+output "infra_services_bot" {
+    driver = "infrabot"
+    endpoint = "http://infra-bot:8787"
+    source = "vps-spaceship-01"
+    credential = env("INFRA_CREDENTIALS_FILE")
+    events = ["service.failed", "service.recovered", "service.started", "service.removed"]
+    fields = ["kind", "project", "service", "container", "image", "state", "health", "previous_status", "status"]
+}
+```
+
+The first poll establishes a silent baseline. Later polls emit only transitions and persist state in a named volume.
 
 ## VPS layout
 
 ```text
 /opt/infrabot/
-├── bin/
-│   └── infra
 ├── credentials/
-│   ├── 0xda-market.json
-│   └── 0xda-market-bot.json
+│   └── vps-spaceship-01.json
 └── targets/
     └── vps-spaceship-01/
         ├── current -> releases/<sha>
@@ -51,13 +111,11 @@ The market repositories continue to own their existing application containers an
 /opt/infra/
 ```
 
-The workflow retains the three newest activated infraBot releases. `infraCLI` is built in GitHub Actions from the selected repository ref and installed atomically at `/opt/infrabot/bin/infra` only after infraBot activation succeeds.
-
-`/opt/infrabot/credentials` is created with mode `0700`. Each logical CLI source uses a separate credential file, preventing a second pairing on the same VPS from replacing the first source's token. infraCLI writes each credential atomically with mode `0600`.
+No host `infra` binary is installed. The same infraCLI executable runs inside `infra-agent` and the one-off `infra-auth` container.
 
 ## GitHub Environment
 
-Create the `vps-spaceship-01` environment in `0x0sky/infraBot`.
+Create environment `vps-spaceship-01` in `0x0sky/infraBot`.
 
 Secrets:
 
@@ -83,8 +141,10 @@ Start from `env.example`:
 ```env
 EDGE_TARGET=vps-spaceship-01
 MARKET_EDGE_NETWORK=nilx-edge
-TELEGRAM_BOT_TOKEN=<infra bot token>
-TELEGRAM_BOT_USERNAME=<infra bot username>
+DOCKER_SOCKET_PROXY_IMAGE=ghcr.io/tecnativa/docker-socket-proxy:0.4.2
+INFRABOT_CREDENTIALS_DIR=/opt/infrabot/credentials
+
+TELEGRAM_BOT_TOKEN=<token for @infra_services_bot>
 TELEGRAM_WEBHOOK_SECRET=<random webhook secret>
 TELEGRAM_ALLOWED_USER_IDS=<comma-separated Telegram user IDs>
 TELEGRAM_CHAT_ID=<notification chat ID>
@@ -99,47 +159,56 @@ chown deploy:deploy /opt/infrabot/targets/vps-spaceship-01/shared/.env
 chmod 0600 /opt/infrabot/targets/vps-spaceship-01/shared/.env
 ```
 
-## Deployment sequence
+## Rollout sequence
 
 1. Merge compatible infraCLI and infraBot changes.
 2. Run `Deploy infraBot to VPS` with `mode=validate`.
 3. Run it with `mode=activate` and confirmation `activate-infrabot`.
-4. Verify local and internal health:
-
-   ```bash
-   curl -fsS http://127.0.0.1:8787/health
-   docker run --rm --network nilx-edge alpine:3.22 \
-     wget -q -O- http://infra-bot:8787/health
-   ```
-
-5. Merge and activate the companion `0x0sky/infra` edge change.
-6. Set `VERIFY_PUBLIC_HTTPS=1` and run `verify.sh`.
-7. Register Telegram's webhook separately at:
+   - infraBot and docker-api start;
+   - infra-agent remains stopped until its credential exists.
+4. Merge and activate companion `0x0sky/infra#8`.
+5. Register Telegram webhook:
 
    ```text
    https://0xda-market.nilx.one/infra/telegram/webhook
    ```
 
-8. Authorize both declared sources with independent credential paths:
+6. Pair the single agent source:
 
    ```bash
-   INFRA_CREDENTIALS_FILE=/opt/infrabot/credentials/0xda-market.json \
-   /opt/infrabot/bin/infra auth telegram \
-     --endpoint https://0xda-market.nilx.one/infra \
-     --source 0xda-market
+   cd /opt/infrabot/targets/vps-spaceship-01/current/deploy/vps
 
-   INFRA_CREDENTIALS_FILE=/opt/infrabot/credentials/0xda-market-bot.json \
-   /opt/infrabot/bin/infra auth telegram \
+   docker compose --profile tools run --rm infra-auth \
+     auth telegram \
      --endpoint https://0xda-market.nilx.one/infra \
-     --source 0xda-market-bot \
+     --source vps-spaceship-01 \
      --no-open
    ```
 
+   The command writes `/opt/infrabot/credentials/vps-spaceship-01.json`.
+
+7. Run `Deploy infraBot to VPS` with `mode=activate` again. The deployment now starts and health-checks `infra-agent`.
+8. Set `VERIFY_PUBLIC_HTTPS=1` and run `verify.sh`.
+
+## Verification
+
+```bash
+curl -fsS http://127.0.0.1:8787/health
+curl -fsS http://127.0.0.1:9090/health
+
+docker run --rm --network nilx-edge alpine:3.22 \
+  wget -q -O- http://infra-bot:8787/health
+
+docker run --rm --network zero-x-infrabot-vps-spaceship-01-monitor alpine:3.22 \
+  wget -q -O- 'http://docker-api:2375/containers/json?all=1'
+```
+
 ## Safety
 
-- `validate` builds and validates a release without changing the active container or host binary;
-- `activate` requires the exact confirmation token `activate-infrabot`;
-- failed activation attempts to restore the previous infraBot release;
-- the workflow never changes DNS, Caddy, market services, databases, or Telegram webhook state;
-- public activation of `/infra/*` must happen only after `infra-bot:8787` is healthy on `nilx-edge`;
-- credentials are source-specific and never committed to Git.
+- `validate` builds both application images without changing live containers;
+- activation requires the exact token `activate-infrabot`;
+- the agent never receives the raw Docker socket;
+- the Docker proxy has no public or shared-edge network;
+- the source credential is stored outside releases with directory mode `0700` and file mode `0600`;
+- failed activation attempts to restore the previous release;
+- DNS, Caddy, market services, databases, and Telegram webhook state remain separate operations.
