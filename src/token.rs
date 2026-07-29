@@ -1,7 +1,5 @@
 use anyhow::{Context, Result, bail};
-use jsonwebtoken::{
-    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode,
-};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -72,7 +70,11 @@ pub fn verify_access_token(secret: &str, access_token: &str) -> Result<Authorize
     .context("verify access token")?
     .claims;
 
-    if !claims.scope.split_whitespace().any(|scope| scope == "events:write") {
+    if !claims
+        .scope
+        .split_whitespace()
+        .any(|scope| scope == "events:write")
+    {
         bail!("access token does not grant events:write");
     }
     let telegram_user_id = claims
