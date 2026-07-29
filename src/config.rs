@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 #[derive(Clone)]
@@ -134,7 +134,12 @@ fn parse_infrabot(lines: &[(usize, &str)], index: &mut usize) -> Result<InfraBot
 
         let (key, value) = assignment(line_number, line)?;
         match key {
-            "bind" => set_once(&mut builder.bind, value_ref(line_number, value)?, line_number, key)?,
+            "bind" => set_once(
+                &mut builder.bind,
+                value_ref(line_number, value)?,
+                line_number,
+                key,
+            )?,
             "public_url" => set_once(
                 &mut builder.public_url,
                 value_ref(line_number, value)?,
@@ -191,20 +196,14 @@ fn parse_telegram(lines: &[(usize, &str)], index: &mut usize) -> Result<Telegram
             "bot_token" => set_once(&mut builder.bot_token, value, line_number, key)?,
             "webhook_secret" => set_once(&mut builder.webhook_secret, value, line_number, key)?,
             "signing_secret" => set_once(&mut builder.signing_secret, value, line_number, key)?,
-            "allowed_user_ids" => {
-                set_once(&mut builder.allowed_user_ids, value, line_number, key)?
-            }
+            "allowed_user_ids" => set_once(&mut builder.allowed_user_ids, value, line_number, key)?,
             _ => bail!("line {line_number}: unknown telegram field {key}"),
         }
     }
     bail!("telegram block is not closed")
 }
 
-fn parse_source(
-    lines: &[(usize, &str)],
-    index: &mut usize,
-    id: String,
-) -> Result<SourceBuilder> {
+fn parse_source(lines: &[(usize, &str)], index: &mut usize, id: String) -> Result<SourceBuilder> {
     validate_identifier("source", &id)?;
     let mut builder = SourceBuilder { id, address: None };
     while let Some((line_number, line)) = lines.get(*index).copied() {
@@ -273,13 +272,10 @@ where
     let public_url = resolve_required(builder.public_url, "public_url", resolver)?;
     validate_url("public_url", &public_url)?;
 
-    let telegram_bot_username = resolve_required(
-        telegram.bot_username,
-        "telegram.bot_username",
-        resolver,
-    )?
-    .trim_start_matches('@')
-    .to_owned();
+    let telegram_bot_username =
+        resolve_required(telegram.bot_username, "telegram.bot_username", resolver)?
+            .trim_start_matches('@')
+            .to_owned();
     if telegram_bot_username.is_empty()
         || !telegram_bot_username
             .chars()
@@ -289,16 +285,10 @@ where
     }
 
     let telegram_bot_token = resolve_secret(telegram.bot_token, "telegram.bot_token", resolver)?;
-    let telegram_webhook_secret = resolve_secret(
-        telegram.webhook_secret,
-        "telegram.webhook_secret",
-        resolver,
-    )?;
-    let signing_secret = resolve_secret(
-        telegram.signing_secret,
-        "telegram.signing_secret",
-        resolver,
-    )?;
+    let telegram_webhook_secret =
+        resolve_secret(telegram.webhook_secret, "telegram.webhook_secret", resolver)?;
+    let signing_secret =
+        resolve_secret(telegram.signing_secret, "telegram.signing_secret", resolver)?;
     let allowed_user_ids = parse_i64_set(&resolve_required(
         telegram.allowed_user_ids,
         "telegram.allowed_user_ids",
@@ -324,7 +314,8 @@ where
     for source in builder.sources {
         let address = resolve_required(source.address, "source.address", resolver)
             .with_context(|| format!("source {}", source.id))?;
-        validate_url("source.address", &address).with_context(|| format!("source {}", source.id))?;
+        validate_url("source.address", &address)
+            .with_context(|| format!("source {}", source.id))?;
         if sources.insert(source.id.clone(), address).is_some() {
             bail!("duplicate source {}", source.id);
         }
@@ -352,7 +343,10 @@ where
             .into_iter()
             .collect::<HashSet<_>>();
         if events.is_empty() {
-            bail!("recipient {} must subscribe to at least one event", recipient.id);
+            bail!(
+                "recipient {} must subscribe to at least one event",
+                recipient.id
+            );
         }
         recipients.push(RecipientConfig {
             id: recipient.id,
@@ -428,17 +422,23 @@ fn assignment<'a>(line_number: usize, line: &'a str) -> Result<(&'a str, &'a str
 }
 
 fn value_ref(line_number: usize, raw: &str) -> Result<ValueRef> {
-    if let Some(name) = raw.strip_prefix("env(\"").and_then(|value| value.strip_suffix("\")")) {
+    if let Some(name) = raw
+        .strip_prefix("env(\"")
+        .and_then(|value| value.strip_suffix("\")"))
+    {
         if name.is_empty()
-            || !name
-                .chars()
-                .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_')
+            || !name.chars().all(|character| {
+                character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+            })
         {
             bail!("line {line_number}: invalid environment variable reference");
         }
         return Ok(ValueRef::Environment(name.to_owned()));
     }
-    if let Some(value) = raw.strip_prefix('"').and_then(|value| value.strip_suffix('"')) {
+    if let Some(value) = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
         return Ok(ValueRef::Literal(value.to_owned()));
     }
     bail!("line {line_number}: value must be quoted or use env(\"NAME\")")
@@ -495,7 +495,7 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let value = value.with_context(|| format!("{field} is required"))?;
-    if !matches!(value, ValueRef::Environment(_)) {
+    if !matches!(&value, ValueRef::Environment(_)) {
         bail!("{field} must use env(\"NAME\") and must not be committed literally");
     }
     value.resolve(field, resolver)
@@ -523,8 +523,9 @@ impl ValueRef {
     {
         let value = match self {
             Self::Literal(value) => value,
-            Self::Environment(name) => resolver(&name)
-                .with_context(|| format!("{field} references missing environment variable {name}"))?,
+            Self::Environment(name) => resolver(&name).with_context(|| {
+                format!("{field} references missing environment variable {name}")
+            })?,
         };
         let value = value.trim().to_owned();
         if value.is_empty() {
@@ -539,21 +540,21 @@ fn env_value(name: &str) -> Option<String> {
 }
 
 fn parse_i64_set(value: &str) -> Result<HashSet<i64>> {
-    value
+    let values = value
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .map(str::parse::<i64>)
-        .collect::<std::result::Result<HashSet<_>, _>>()
-        .map_err(Into::into)
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
+    Ok(values)
 }
 
 fn validate_identifier(kind: &str, value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 64
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
     {
         bail!("{kind} id must contain 1-64 ASCII letters, digits, dots, dashes, or underscores");
     }
@@ -569,7 +570,9 @@ fn validate_url(field: &str, value: &str) -> Result<()> {
     {
         bail!("{field} must not contain credentials, a query, or a fragment");
     }
-    let host = parsed.host_str().with_context(|| format!("{field} has no host"))?;
+    let host = parsed
+        .host_str()
+        .with_context(|| format!("{field} has no host"))?;
     let secure = parsed.scheme() == "https";
     let local = parsed.scheme() == "http" && matches!(host, "localhost" | "127.0.0.1" | "::1");
     if !secure && !local {
@@ -678,10 +681,7 @@ infrabot {
 
     #[test]
     fn rejects_insecure_remote_urls() {
-        let input = document().replace(
-            "https://primary.example",
-            "http://primary.example",
-        );
+        let input = document().replace("https://primary.example", "http://primary.example");
         assert!(parse_document(&input, &resolver).is_err());
     }
 }
