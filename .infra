@@ -14,7 +14,7 @@ project "infrabot" {
 
 infrabot {
     bind = "0.0.0.0:8787"
-    public_url = env("INFRABOT_PUBLIC_URL")
+    public_url = "https://0xda-market.nilx.one/infra"
     pairing_ttl_seconds = 300
     access_token_ttl_seconds = 2592000
     poll_interval_seconds = 2
@@ -29,12 +29,12 @@ infrabot {
         allowed_user_ids = env("TELEGRAM_ALLOWED_USER_IDS")
     }
 
-    source "primary" {
-        address = "https://primary.example"
+    source "0xda-market" {
+        address = "https://0xda-market.nilx.one"
     }
 
-    source "secondary" {
-        address = "https://secondary.example"
+    source "0xda-market-bot" {
+        address = "https://0xda-market.nilx.one/bot"
     }
 
     recipient "owner" {
