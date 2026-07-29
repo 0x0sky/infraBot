@@ -1,24 +1,31 @@
-use anyhow::{Context, Result};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use serde::Serialize;
+use anyhow::{Context, Result, bail};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode,
+};
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-#[derive(Serialize)]
-struct Claims<'a> {
-    iss: &'static str,
-    aud: &'static str,
+#[derive(Deserialize, Serialize)]
+struct Claims {
+    iss: String,
+    aud: String,
     sub: String,
-    source: &'a str,
+    source: String,
     jti: String,
     iat: u64,
     exp: u64,
-    scope: &'static str,
+    scope: String,
 }
 
 pub struct IssuedToken {
     pub access_token: String,
     pub expires_at: u64,
+}
+
+pub struct AuthorizedSource {
+    pub telegram_user_id: i64,
+    pub source: String,
 }
 
 pub fn issue_access_token(
@@ -30,14 +37,14 @@ pub fn issue_access_token(
     let issued_at = unix_now();
     let expires_at = issued_at.saturating_add(ttl_seconds);
     let claims = Claims {
-        iss: "infraBot",
-        aud: "infraCLI",
+        iss: "infraBot".to_owned(),
+        aud: "infraCLI".to_owned(),
         sub: telegram_user_id.to_string(),
-        source,
+        source: source.to_owned(),
         jti: Uuid::new_v4().to_string(),
         iat: issued_at,
         exp: expires_at,
-        scope: "events:write",
+        scope: "events:write".to_owned(),
     };
     let header = Header::new(Algorithm::HS256);
     let access_token = encode(
@@ -53,6 +60,35 @@ pub fn issue_access_token(
     })
 }
 
+pub fn verify_access_token(secret: &str, access_token: &str) -> Result<AuthorizedSource> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_audience(&["infraCLI"]);
+    validation.set_issuer(&["infraBot"]);
+    let claims = decode::<Claims>(
+        access_token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .context("verify access token")?
+    .claims;
+
+    if !claims.scope.split_whitespace().any(|scope| scope == "events:write") {
+        bail!("access token does not grant events:write");
+    }
+    let telegram_user_id = claims
+        .sub
+        .parse::<i64>()
+        .context("access token subject is not a Telegram user id")?;
+    if claims.source.is_empty() {
+        bail!("access token has no source");
+    }
+
+    Ok(AuthorizedSource {
+        telegram_user_id,
+        source: claims.source,
+    })
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -65,10 +101,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn issues_source_bound_token() {
+    fn issues_and_verifies_source_bound_token() {
         let secret = "x".repeat(32);
         let issued = issue_access_token(&secret, 42, "primary", 300).unwrap();
-        assert!(!issued.access_token.is_empty());
+        let authorized = verify_access_token(&secret, &issued.access_token).unwrap();
+        assert_eq!(authorized.telegram_user_id, 42);
+        assert_eq!(authorized.source, "primary");
         assert!(issued.expires_at > unix_now());
+    }
+
+    #[test]
+    fn rejects_token_signed_by_another_key() {
+        let issued = issue_access_token(&"x".repeat(32), 42, "primary", 300).unwrap();
+        assert!(verify_access_token(&"y".repeat(32), &issued.access_token).is_err());
     }
 }
