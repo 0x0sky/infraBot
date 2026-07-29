@@ -30,51 +30,53 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("src/main.rs")
           text = path.read_text()
-          if "    output: String," not in text:
-              old = '''struct EventRequest {
-              kind: String,'''
-              new = '''struct EventRequest {
-              output: String,
-              kind: String,'''
-              if old not in text:
+
+          if "output: String" not in text:
+              text, count = re.subn(
+                  r"(struct EventRequest\s*\{\s*\n)(\s*)(kind:\s*String,)",
+                  r"\1\2output: String,\n\2\3",
+                  text,
+                  count=1,
+              )
+              if count != 1:
                   raise SystemExit("EventRequest declaration not found")
-              text = text.replace(old, new, 1)
 
-          guard = '''    if request.output.trim_start_matches('@') != state.config.telegram_bot_username {
-              return api_error(StatusCode::BAD_REQUEST, "unknown_output");
-          }
-          '''
-          marker = '''    if !valid_event(&request) {
-              return api_error(StatusCode::BAD_REQUEST, "invalid_event");
-          }
-          '''
-          if guard not in text:
-              if marker not in text:
+          if 'request.output.trim_start_matches' not in text:
+              marker = re.search(r"\n(\s*)if !valid_event\(&request\) \{", text)
+              if marker is None:
                   raise SystemExit("event validation marker not found")
-              text = text.replace(marker, guard + marker, 1)
+              indent = marker.group(1)
+              guard = (
+                  f"\n{indent}if request.output.trim_start_matches('@') "
+                  "!= state.config.telegram_bot_username {\n"
+                  f"{indent}    return api_error(StatusCode::BAD_REQUEST, \"unknown_output\");\n"
+                  f"{indent}}}\n"
+              )
+              text = text[: marker.start()] + guard + text[marker.start():]
 
-          old = '''fn valid_event(event: &EventRequest) -> bool {
-              valid_token(&event.kind, 128)'''
-          new = '''fn valid_event(event: &EventRequest) -> bool {
-              valid_token(&event.output, 64)
-                  && valid_token(&event.kind, 128)'''
-          if old in text:
-              text = text.replace(old, new, 1)
-          elif "valid_token(&event.output, 64)" not in text:
-              raise SystemExit("valid_event function not found")
+          if "valid_token(&event.output, 64)" not in text:
+              text, count = re.subn(
+                  r"(fn valid_event\(event: &EventRequest\) -> bool \{\s*\n)(\s*)(valid_token\(&event.kind, 128\))",
+                  r"\1\2valid_token(&event.output, 64)\n\2    && \3",
+                  text,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit("valid_event function not found")
 
-          fixture = '''        let event = EventRequest {
-                  kind: "service.failed".into(),'''
-          fixture_with_output = '''        let event = EventRequest {
-                  output: "infra_services_bot".into(),
-                  kind: "service.failed".into(),'''
-          if fixture in text:
-              text = text.replace(fixture, fixture_with_output, 1)
-          elif fixture_with_output not in text:
-              raise SystemExit("EventRequest test fixture not found")
+          if 'output: "infra_services_bot".into()' not in text:
+              text, count = re.subn(
+                  r"(let event = EventRequest\s*\{\s*\n)(\s*)(kind: \"service\.failed\"\.into\(\),)",
+                  r'\1\2output: "infra_services_bot".into(),\n\2\3',
+                  text,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit("EventRequest test fixture not found")
 
           path.write_text(text)
 
@@ -105,6 +107,7 @@ jobs:
               )
               readme.write_text(doc)
           PY
+      - run: cargo fmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
