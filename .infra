@@ -30,11 +30,11 @@ infrabot {
     }
 
     source "primary" {
-        address = env("INFRA_PRIMARY_ADDRESS")
+        address = "https://primary.example"
     }
 
     source "secondary" {
-        address = env("INFRA_SECONDARY_ADDRESS")
+        address = "https://secondary.example"
     }
 
     recipient "owner" {
