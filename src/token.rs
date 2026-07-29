@@ -5,10 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[derive(Serialize)]
-struct Claims {
+struct Claims<'a> {
     iss: &'static str,
     aud: &'static str,
     sub: String,
+    source: &'a str,
     jti: String,
     iat: u64,
     exp: u64,
@@ -23,6 +24,7 @@ pub struct IssuedToken {
 pub fn issue_access_token(
     secret: &str,
     telegram_user_id: i64,
+    source: &str,
     ttl_seconds: u64,
 ) -> Result<IssuedToken> {
     let issued_at = unix_now();
@@ -31,6 +33,7 @@ pub fn issue_access_token(
         iss: "infraBot",
         aud: "infraCLI",
         sub: telegram_user_id.to_string(),
+        source,
         jti: Uuid::new_v4().to_string(),
         iat: issued_at,
         exp: expires_at,
@@ -62,9 +65,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn issues_non_empty_token() {
+    fn issues_source_bound_token() {
         let secret = "x".repeat(32);
-        let issued = issue_access_token(&secret, 42, 300).unwrap();
+        let issued = issue_access_token(&secret, 42, "primary", 300).unwrap();
         assert!(!issued.access_token.is_empty());
         assert!(issued.expires_at > unix_now());
     }
