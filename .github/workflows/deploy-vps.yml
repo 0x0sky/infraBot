@@ -119,6 +119,7 @@ jobs:
 
           test -f "$shared_env"
           install -d -m 0755 "$target_root/releases" "$target_root/shared" "$DEPLOY_PATH/bin"
+          install -d -m 0700 "$DEPLOY_PATH/credentials"
           rm -rf "$release_dir"
           mkdir -p "$release_dir"
           tar -xzf "$archive" -C "$release_dir"
