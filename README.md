@@ -16,6 +16,8 @@ infraCLI · vps-01 ─┘
 
 Every CLI creates its own pairing session, verifier, and token exchange. Sessions are keyed independently, issued tokens have unique IDs, and credentials remain local to each CLI host. Authorizing a second CLI does not overwrite or revoke the first CLI.
 
+The current contract identifies authorization by Telegram account and pairing session. A persistent installation identity is deliberately deferred until infraBot adds per-device listing and revocation; it is not required for safely connecting multiple CLI instances.
+
 ## authorization flow
 
 ```text
