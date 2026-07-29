@@ -29,6 +29,7 @@ struct PairingSession {
     last_exchange_at: Option<Instant>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct CreatedPairing {
     pub session_id: Uuid,
     pub start_token: String,
@@ -119,16 +120,21 @@ impl PairingStore {
         let Some(session_id) = self.start_index.get(&start_token_digest).copied() else {
             return ApproveOutcome::NotFound;
         };
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            self.start_index.remove(&start_token_digest);
-            return ApproveOutcome::NotFound;
-        };
 
-        if session.expires_at <= unix_now() {
+        let expired = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.expires_at <= unix_now());
+        if expired {
             self.sessions.remove(&session_id);
             self.start_index.remove(&start_token_digest);
             return ApproveOutcome::Expired;
         }
+
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            self.start_index.remove(&start_token_digest);
+            return ApproveOutcome::NotFound;
+        };
         if session.consumed {
             return ApproveOutcome::Consumed;
         }
@@ -143,24 +149,24 @@ impl PairingStore {
     }
 
     pub fn exchange(&mut self, session_id: Uuid, verifier: &str) -> ExchangeOutcome {
-        let now = unix_now();
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            return ExchangeOutcome::NotFound;
-        };
-
-        if session.expires_at <= now {
-            let start_token_digest = session.start_token_digest;
+        let expired_digest = self.sessions.get(&session_id).and_then(|session| {
+            (session.expires_at <= unix_now()).then_some(session.start_token_digest)
+        });
+        if let Some(start_token_digest) = expired_digest {
             self.sessions.remove(&session_id);
             self.start_index.remove(&start_token_digest);
             return ExchangeOutcome::Expired;
         }
+
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return ExchangeOutcome::NotFound;
+        };
         if session.consumed {
             return ExchangeOutcome::Consumed;
         }
-        if session
-            .last_exchange_at
-            .is_some_and(|previous| previous.elapsed() < Duration::from_secs(self.poll_interval_seconds))
-        {
+        if session.last_exchange_at.is_some_and(|previous| {
+            previous.elapsed() < Duration::from_secs(self.poll_interval_seconds)
+        }) {
             return ExchangeOutcome::SlowDown;
         }
         session.last_exchange_at = Some(Instant::now());
@@ -226,7 +232,7 @@ mod tests {
     #[test]
     fn exchanges_only_after_approval() {
         let (verifier, challenge) = verifier_and_challenge();
-        let mut store = PairingStore::new(300, 1, 10, 5);
+        let mut store = PairingStore::new(300, 0, 10, 5);
         let CreateOutcome::Created(created) = store.create(challenge) else {
             panic!("pairing was not created");
         };
@@ -239,7 +245,6 @@ mod tests {
             store.approve(&created.start_token, 42),
             ApproveOutcome::Approved
         );
-        std::thread::sleep(Duration::from_secs(1));
         assert_eq!(
             store.exchange(created.session_id, &verifier),
             ExchangeOutcome::Approved(42)
@@ -253,7 +258,7 @@ mod tests {
     #[test]
     fn rejects_wrong_verifier() {
         let (_, challenge) = verifier_and_challenge();
-        let mut store = PairingStore::new(300, 1, 10, 5);
+        let mut store = PairingStore::new(300, 0, 10, 5);
         let CreateOutcome::Created(created) = store.create(challenge) else {
             panic!("pairing was not created");
         };
