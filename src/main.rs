@@ -267,7 +267,10 @@ async fn deliver_event(
     let Ok(authorized) = verify_access_token(&state.config.signing_secret, access_token) else {
         return api_error(StatusCode::UNAUTHORIZED, "invalid_access_token");
     };
-    if !state.config.allowed_user_ids.contains(&authorized.telegram_user_id)
+    if !state
+        .config
+        .allowed_user_ids
+        .contains(&authorized.telegram_user_id)
         || !state.config.sources.contains_key(&authorized.source)
     {
         return api_error(StatusCode::FORBIDDEN, "source_not_authorized");
