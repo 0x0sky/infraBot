@@ -1,0 +1,734 @@
+name: finalize multi-user subscriptions
+
+on:
+  push:
+    branches:
+      - agent/secure-cli-pairing
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/secure-cli-pairing
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Implement persistent Telegram subscriptions
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          subscribers = r'''use anyhow::{Context, Result, bail};
+          use serde::{Deserialize, Serialize};
+          use std::{
+              collections::BTreeMap,
+              fs::{self, OpenOptions},
+              io::Write,
+              path::{Path, PathBuf},
+              time::{SystemTime, UNIX_EPOCH},
+          };
+
+          const DOCUMENT_VERSION: u8 = 1;
+
+          #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+          struct Subscriber {
+              user_id: i64,
+              chat_id: i64,
+              subscribed_at: u64,
+          }
+
+          #[derive(Debug, Serialize, Deserialize)]
+          struct SubscriberDocument {
+              version: u8,
+              subscribers: Vec<Subscriber>,
+          }
+
+          #[derive(Debug, PartialEq, Eq)]
+          pub enum SubscribeOutcome {
+              Added,
+              Updated,
+              AlreadySubscribed,
+          }
+
+          pub struct SubscriberStore {
+              path: PathBuf,
+              subscribers: BTreeMap<i64, Subscriber>,
+          }
+
+          impl SubscriberStore {
+              pub fn load(path: PathBuf) -> Result<Self> {
+                  if !path.exists() {
+                      return Ok(Self {
+                          path,
+                          subscribers: BTreeMap::new(),
+                      });
+                  }
+
+                  let content = fs::read_to_string(&path)
+                      .with_context(|| format!("read subscriber store {}", path.display()))?;
+                  let document: SubscriberDocument = serde_json::from_str(&content)
+                      .with_context(|| format!("decode subscriber store {}", path.display()))?;
+                  if document.version != DOCUMENT_VERSION {
+                      bail!("unsupported subscriber store version {}", document.version);
+                  }
+
+                  let mut subscribers = BTreeMap::new();
+                  for subscriber in document.subscribers {
+                      if subscriber.user_id == 0 || subscriber.chat_id == 0 {
+                          bail!("subscriber store contains an invalid Telegram identity");
+                      }
+                      if subscribers
+                          .insert(subscriber.user_id, subscriber)
+                          .is_some()
+                      {
+                          bail!("subscriber store contains a duplicate Telegram user");
+                      }
+                  }
+
+                  Ok(Self { path, subscribers })
+              }
+
+              pub fn len(&self) -> usize {
+                  self.subscribers.len()
+              }
+
+              pub fn is_subscribed(&self, user_id: i64) -> bool {
+                  self.subscribers.contains_key(&user_id)
+              }
+
+              pub fn chat_ids(&self) -> Vec<i64> {
+                  self.subscribers
+                      .values()
+                      .map(|subscriber| subscriber.chat_id)
+                      .collect()
+              }
+
+              pub fn subscribe(&mut self, user_id: i64, chat_id: i64) -> Result<SubscribeOutcome> {
+                  if user_id == 0 || chat_id == 0 {
+                      bail!("Telegram user and chat ids must not be zero");
+                  }
+                  let previous = self.subscribers.get(&user_id).cloned();
+                  let outcome = match previous.as_ref() {
+                      None => SubscribeOutcome::Added,
+                      Some(existing) if existing.chat_id == chat_id => {
+                          SubscribeOutcome::AlreadySubscribed
+                      }
+                      Some(_) => SubscribeOutcome::Updated,
+                  };
+                  if outcome == SubscribeOutcome::AlreadySubscribed {
+                      return Ok(outcome);
+                  }
+
+                  self.subscribers.insert(
+                      user_id,
+                      Subscriber {
+                          user_id,
+                          chat_id,
+                          subscribed_at: unix_now(),
+                      },
+                  );
+                  if let Err(error) = self.persist() {
+                      match previous {
+                          Some(previous) => {
+                              self.subscribers.insert(user_id, previous);
+                          }
+                          None => {
+                              self.subscribers.remove(&user_id);
+                          }
+                      }
+                      return Err(error);
+                  }
+                  Ok(outcome)
+              }
+
+              pub fn unsubscribe(&mut self, user_id: i64) -> Result<bool> {
+                  let previous = self.subscribers.remove(&user_id);
+                  let Some(previous) = previous else {
+                      return Ok(false);
+                  };
+                  if let Err(error) = self.persist() {
+                      self.subscribers.insert(user_id, previous);
+                      return Err(error);
+                  }
+                  Ok(true)
+              }
+
+              fn persist(&self) -> Result<()> {
+                  let parent = self
+                      .path
+                      .parent()
+                      .context("subscriber store path has no parent")?;
+                  fs::create_dir_all(parent)
+                      .with_context(|| format!("create subscriber store directory {}", parent.display()))?;
+                  let document = SubscriberDocument {
+                      version: DOCUMENT_VERSION,
+                      subscribers: self.subscribers.values().cloned().collect(),
+                  };
+                  let content = serde_json::to_vec_pretty(&document)
+                      .context("encode subscriber store")?;
+                  let temporary = temporary_path(parent);
+                  let mut file = OpenOptions::new()
+                      .write(true)
+                      .create_new(true)
+                      .open(&temporary)
+                      .with_context(|| format!("create temporary subscriber store {}", temporary.display()))?;
+                  set_private_permissions(&file)?;
+                  file.write_all(&content)
+                      .context("write temporary subscriber store")?;
+                  file.sync_all().context("sync temporary subscriber store")?;
+                  fs::rename(&temporary, &self.path)
+                      .with_context(|| format!("replace subscriber store {}", self.path.display()))?;
+                  Ok(())
+              }
+          }
+
+          fn temporary_path(parent: &Path) -> PathBuf {
+              parent.join(format!(".subscribers-{}-{}.tmp", std::process::id(), unix_now()))
+          }
+
+          #[cfg(unix)]
+          fn set_private_permissions(file: &fs::File) -> Result<()> {
+              use std::os::unix::fs::PermissionsExt;
+              file.set_permissions(fs::Permissions::from_mode(0o600))
+                  .context("set subscriber store permissions")
+          }
+
+          #[cfg(not(unix))]
+          fn set_private_permissions(_file: &fs::File) -> Result<()> {
+              Ok(())
+          }
+
+          fn unix_now() -> u64 {
+              SystemTime::now()
+                  .duration_since(UNIX_EPOCH)
+                  .unwrap_or_default()
+                  .as_secs()
+          }
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+
+              #[test]
+              fn persists_multiple_subscribers_and_unsubscribes_independently() {
+                  let root = std::env::temp_dir().join(format!(
+                      "infrabot-subscribers-{}-{}",
+                      std::process::id(),
+                      unix_now()
+                  ));
+                  let path = root.join("subscribers.json");
+                  let mut store = SubscriberStore::load(path.clone()).unwrap();
+                  assert_eq!(store.subscribe(42, 42).unwrap(), SubscribeOutcome::Added);
+                  assert_eq!(store.subscribe(77, 77).unwrap(), SubscribeOutcome::Added);
+                  assert_eq!(store.len(), 2);
+
+                  let mut restored = SubscriberStore::load(path).unwrap();
+                  assert!(restored.is_subscribed(42));
+                  assert!(restored.is_subscribed(77));
+                  assert!(restored.unsubscribe(42).unwrap());
+                  assert!(!restored.is_subscribed(42));
+                  assert!(restored.is_subscribed(77));
+                  let _ = fs::remove_dir_all(root);
+              }
+          }
+          '''
+          Path("src/subscribers.rs").write_text(subscribers)
+
+          cargo = Path("Cargo.toml")
+          text = cargo.read_text()
+          if 'serde_json = "1.0"' not in text:
+              text = text.replace('serde = { version = "1.0", features = ["derive"] }\n', 'serde = { version = "1.0", features = ["derive"] }\nserde_json = "1.0"\n')
+          cargo.write_text(text)
+
+          telegram = Path("src/telegram.rs")
+          text = telegram.read_text()
+          start = text.index('pub fn start_payload')
+          end = text.index('\npub async fn send_message', start)
+          parser = r'''#[derive(Debug, PartialEq, Eq)]
+          pub enum TelegramCommand<'a> {
+              Subscribe,
+              Approve(&'a str),
+              Unsubscribe,
+              Status,
+          }
+
+          pub fn command(text: &str) -> Option<TelegramCommand<'_>> {
+              let mut parts = text.split_whitespace();
+              let command = parts.next()?.split('@').next()?;
+              let argument = parts.next();
+              if parts.next().is_some() {
+                  return None;
+              }
+              match (command, argument) {
+                  ("/start", None) => Some(TelegramCommand::Subscribe),
+                  ("/start", Some(payload)) => Some(TelegramCommand::Approve(payload)),
+                  ("/stop", None) => Some(TelegramCommand::Unsubscribe),
+                  ("/status", None) => Some(TelegramCommand::Status),
+                  _ => None,
+              }
+          }
+          '''
+          text = text[:start] + parser + text[end:]
+          text = text.replace(
+              '''    fn parses_start_payload() {
+                  assert_eq!(start_payload("/start abc"), Some("abc"));
+                  assert_eq!(start_payload("/start@infra_bot abc"), Some("abc"));
+                  assert_eq!(start_payload("/start"), None);
+                  assert_eq!(start_payload("hello abc"), None);
+              }''',
+              '''    fn parses_commands() {
+                  assert_eq!(command("/start"), Some(TelegramCommand::Subscribe));
+                  assert_eq!(command("/start abc"), Some(TelegramCommand::Approve("abc")));
+                  assert_eq!(
+                      command("/start@infra_bot abc"),
+                      Some(TelegramCommand::Approve("abc"))
+                  );
+                  assert_eq!(command("/stop"), Some(TelegramCommand::Unsubscribe));
+                  assert_eq!(command("/status"), Some(TelegramCommand::Status));
+                  assert_eq!(command("hello"), None);
+              }'''
+          )
+          telegram.write_text(text)
+
+          config = Path("src/config.rs")
+          text = config.read_text()
+          text = text.replace(
+              '    pub allowed_user_ids: HashSet<i64>,\n    pub sources:',
+              '    pub allowed_user_ids: HashSet<i64>,\n    pub subscriber_user_ids: HashSet<i64>,\n    pub subscriber_store: PathBuf,\n    pub subscriber_events: HashSet<String>,\n    pub sources:'
+          )
+          text = text.replace(
+              '    allowed_user_ids: Option<ValueRef>,\n}',
+              '    allowed_user_ids: Option<ValueRef>,\n    subscriber_user_ids: Option<ValueRef>,\n    subscriber_store: Option<ValueRef>,\n    subscriber_events: Option<Vec<String>>,\n}'
+          )
+          old_parse = re.compile(r'fn parse_telegram\([\s\S]*?\n}\n\nfn parse_source', re.M)
+          new_parse = r'''fn parse_telegram(lines: &[(usize, &str)], index: &mut usize) -> Result<TelegramBuilder> {
+              let mut builder = TelegramBuilder::default();
+              while let Some((line_number, line)) = lines.get(*index).copied() {
+                  *index += 1;
+                  if line == "}" {
+                      return Ok(builder);
+                  }
+                  let (key, raw) = assignment(line_number, line)?;
+                  match key {
+                      "subscriber_events" => set_once(
+                          &mut builder.subscriber_events,
+                          string_list(line_number, raw)?,
+                          line_number,
+                          key,
+                      )?,
+                      "bot_username" => set_once(
+                          &mut builder.bot_username,
+                          value_ref(line_number, raw)?,
+                          line_number,
+                          key,
+                      )?,
+                      "bot_token" => set_once(
+                          &mut builder.bot_token,
+                          value_ref(line_number, raw)?,
+                          line_number,
+                          key,
+                      )?,
+                      "webhook_secret" => set_once(
+                          &mut builder.webhook_secret,
+                          value_ref(line_number, raw)?,
+                          line_number,
+                          key,
+                      )?,
+                      "signing_secret" => set_once(
+                          &mut builder.signing_secret,
+                          value_ref(line_number, raw)?,
+                          line_number,
+                          key,
+                      )?,
+                      "allowed_user_ids" => set_once(
+                          &mut builder.allowed_user_ids,
+                          value_ref(line_number, raw)?,
+                          line_number,
+                          key,
+                      )?,
+                      "subscriber_user_ids" => set_once(
+                          &mut builder.subscriber_user_ids,
+                          value_ref(line_number, raw)?,
+                          line_number,
+                          key,
+                      )?,
+                      "subscriber_store" => set_once(
+                          &mut builder.subscriber_store,
+                          value_ref(line_number, raw)?,
+                          line_number,
+                          key,
+                      )?,
+                      _ => bail!("line {line_number}: unknown telegram field {key}"),
+                  }
+              }
+              bail!("telegram block is not closed")
+          }
+
+          fn parse_source'''
+          text, count = old_parse.subn(new_parse, text, count=1)
+          if count != 1:
+              raise SystemExit("parse_telegram function not found")
+
+          marker = '''    if allowed_user_ids.is_empty() {
+                  bail!("telegram.allowed_user_ids must contain at least one user id");
+              }
+          '''
+          addition = marker + '''    let subscriber_user_ids = match telegram.subscriber_user_ids {
+                  Some(value) => parse_i64_set(&value.resolve("telegram.subscriber_user_ids", resolver)?)
+                      .context("telegram.subscriber_user_ids must be comma-separated integers")?,
+                  None => allowed_user_ids.clone(),
+              };
+              if subscriber_user_ids.is_empty() {
+                  bail!("telegram.subscriber_user_ids must contain at least one user id");
+              }
+              let subscriber_store = PathBuf::from(resolve_or(
+                  telegram.subscriber_store,
+                  "/var/lib/infrabot/subscribers.json",
+                  "telegram.subscriber_store",
+                  resolver,
+              )?);
+              if !subscriber_store.is_absolute() {
+                  bail!("telegram.subscriber_store must be an absolute path");
+              }
+              let subscriber_events = telegram
+                  .subscriber_events
+                  .context("telegram.subscriber_events is required")?
+                  .into_iter()
+                  .collect::<HashSet<_>>();
+              if subscriber_events.is_empty() {
+                  bail!("telegram.subscriber_events must contain at least one event");
+              }
+          '''
+          if 'let subscriber_user_ids = match telegram.subscriber_user_ids' not in text:
+              if marker not in text:
+                  raise SystemExit("allowed user validation marker not found")
+              text = text.replace(marker, addition, 1)
+          text = text.replace(
+              '''        allowed_user_ids,
+                  sources,''',
+              '''        allowed_user_ids,
+                  subscriber_user_ids,
+                  subscriber_store,
+                  subscriber_events,
+                  sources,'''
+          )
+          text = text.replace(
+              '''    if recipients.is_empty() {
+                  bail!("infrabot must declare at least one recipient");
+              }
+
+          ''',
+              ''
+          )
+          text = text.replace(
+              '            "ALLOWED_USERS" => Some("42,77".into()),\n            "OWNER_CHAT"',
+              '            "ALLOWED_USERS" => Some("42".into()),\n            "SUBSCRIBERS" => Some("42,77".into()),\n            "OWNER_CHAT"'
+          )
+          text = text.replace(
+              '''        allowed_user_ids = env("ALLOWED_USERS")
+              }''',
+              '''        allowed_user_ids = env("ALLOWED_USERS")
+                  subscriber_user_ids = env("SUBSCRIBERS")
+                  subscriber_store = "/var/lib/infrabot/subscribers.json"
+                  subscriber_events = ["service.failed", "service.recovered"]
+              }'''
+          )
+          text = text.replace(
+              '        assert_eq!(config.recipients[0].chat_id, 42);',
+              '        assert_eq!(config.subscriber_user_ids.len(), 2);\n        assert!(config.subscriber_events.contains("service.failed"));\n        assert_eq!(config.recipients[0].chat_id, 42);'
+          )
+          config.write_text(text)
+
+          main = Path("src/main.rs")
+          text = main.read_text()
+          text = text.replace('mod store;\n', 'mod store;\nmod subscribers;\n')
+          text = text.replace(
+              'use store::{ApproveOutcome, CreateOutcome, ExchangeOutcome, PairingStore, decode_challenge};\n',
+              'use store::{ApproveOutcome, CreateOutcome, ExchangeOutcome, PairingStore, decode_challenge};\nuse subscribers::{SubscribeOutcome, SubscriberStore};\n'
+          )
+          text = text.replace(
+              'use telegram::{TelegramUpdate, send_message, start_payload};',
+              'use telegram::{TelegramCommand, TelegramUpdate, command, send_message};'
+          )
+          text = text.replace(
+              '    store: Arc<Mutex<PairingStore>>,\n    http: Client,',
+              '    store: Arc<Mutex<PairingStore>>,\n    subscribers: Arc<Mutex<SubscriberStore>>,\n    http: Client,'
+          )
+          text = text.replace(
+              '''    let store = PairingStore::new(
+                  config.pairing_ttl_seconds,
+                  config.poll_interval_seconds,
+                  config.max_active_pairings,
+                  config.max_exchange_attempts,
+              );''',
+              '''    let store = PairingStore::new(
+                  config.pairing_ttl_seconds,
+                  config.poll_interval_seconds,
+                  config.max_active_pairings,
+                  config.max_exchange_attempts,
+              );
+              let subscribers = SubscriberStore::load(config.subscriber_store.clone())?;
+              let subscriber_count = subscribers.len();
+              info!(subscriber_count, "Telegram subscribers loaded");'''
+          )
+          text = text.replace(
+              '        store: Arc::new(Mutex::new(store)),\n        http,',
+              '        store: Arc::new(Mutex::new(store)),\n        subscribers: Arc::new(Mutex::new(subscribers)),\n        http,'
+          )
+          old_chats = '''    let chat_ids = state
+                  .config
+                  .recipients
+                  .iter()
+                  .filter(|recipient| recipient_matches(recipient, &request.kind))
+                  .map(|recipient| recipient.chat_id)
+                  .collect::<HashSet<_>>();'''
+          new_chats = '''    let mut chat_ids = state
+                  .config
+                  .recipients
+                  .iter()
+                  .filter(|recipient| recipient_matches(recipient, &request.kind))
+                  .map(|recipient| recipient.chat_id)
+                  .collect::<HashSet<_>>();
+              if state.config.subscriber_events.contains("*")
+                  || state.config.subscriber_events.contains(&request.kind)
+              {
+                  let subscribers = state.subscribers.lock().await;
+                  chat_ids.extend(subscribers.chat_ids());
+              }'''
+          if old_chats not in text:
+              raise SystemExit("delivery chat collection not found")
+          text = text.replace(old_chats, new_chats, 1)
+
+          webhook_pattern = re.compile(r'async fn telegram_webhook\([\s\S]*?\n}\n\nfn bearer_token', re.M)
+          webhook = r'''async fn telegram_webhook(
+              State(state): State<AppState>,
+              headers: HeaderMap,
+              Json(update): Json<TelegramUpdate>,
+          ) -> Response {
+              let supplied_secret = headers
+                  .get(TELEGRAM_SECRET_HEADER)
+                  .and_then(|value| value.to_str().ok())
+                  .unwrap_or_default();
+              if !secure_eq(supplied_secret, &state.config.telegram_webhook_secret) {
+                  return api_error(StatusCode::UNAUTHORIZED, "invalid_webhook_secret");
+              }
+
+              let Some(message) = update.message else {
+                  return StatusCode::OK.into_response();
+              };
+              if message.chat.kind != "private" {
+                  return StatusCode::OK.into_response();
+              }
+              let Some(user) = message.from else {
+                  return StatusCode::OK.into_response();
+              };
+              let Some(text) = message.text.as_deref() else {
+                  return StatusCode::OK.into_response();
+              };
+              let Some(command) = command(text) else {
+                  return StatusCode::OK.into_response();
+              };
+
+              let reply = match command {
+                  TelegramCommand::Subscribe => {
+                      if !state.config.subscriber_user_ids.contains(&user.id) {
+                          "this Telegram account is not allowed to subscribe".to_owned()
+                      } else {
+                          let outcome = {
+                              let mut subscribers = state.subscribers.lock().await;
+                              subscribers.subscribe(user.id, message.chat.id)
+                          };
+                          match outcome {
+                              Ok(SubscribeOutcome::Added | SubscribeOutcome::Updated) => {
+                                  "subscribed to infra notifications".to_owned()
+                              }
+                              Ok(SubscribeOutcome::AlreadySubscribed) => {
+                                  "already subscribed to infra notifications".to_owned()
+                              }
+                              Err(error) => {
+                                  warn!(user_id = user.id, error = %error, "subscriber persistence failed");
+                                  "subscription could not be saved".to_owned()
+                              }
+                          }
+                      }
+                  }
+                  TelegramCommand::Unsubscribe => {
+                      if !state.config.subscriber_user_ids.contains(&user.id) {
+                          "this Telegram account is not allowed to subscribe".to_owned()
+                      } else {
+                          let outcome = {
+                              let mut subscribers = state.subscribers.lock().await;
+                              subscribers.unsubscribe(user.id)
+                          };
+                          match outcome {
+                              Ok(true) => "unsubscribed from infra notifications".to_owned(),
+                              Ok(false) => "not subscribed to infra notifications".to_owned(),
+                              Err(error) => {
+                                  warn!(user_id = user.id, error = %error, "subscriber persistence failed");
+                                  "subscription change could not be saved".to_owned()
+                              }
+                          }
+                      }
+                  }
+                  TelegramCommand::Status => {
+                      if !state.config.subscriber_user_ids.contains(&user.id) {
+                          "this Telegram account is not allowed to subscribe".to_owned()
+                      } else {
+                          let subscribed = {
+                              let subscribers = state.subscribers.lock().await;
+                              subscribers.is_subscribed(user.id)
+                          };
+                          if subscribed {
+                              "subscribed to infra notifications".to_owned()
+                          } else {
+                              "not subscribed to infra notifications".to_owned()
+                          }
+                      }
+                  }
+                  TelegramCommand::Approve(payload) => {
+                      if !state.config.allowed_user_ids.contains(&user.id) {
+                          "this Telegram account cannot authorize infra sources".to_owned()
+                      } else {
+                          let outcome = {
+                              let mut store = state.store.lock().await;
+                              store.approve(payload, user.id)
+                          };
+                          match outcome {
+                              ApproveOutcome::Approved(source)
+                              | ApproveOutcome::AlreadyApproved(source) => {
+                                  if state.config.subscriber_user_ids.contains(&user.id) {
+                                      let subscription = {
+                                          let mut subscribers = state.subscribers.lock().await;
+                                          subscribers.subscribe(user.id, message.chat.id)
+                                      };
+                                      if let Err(error) = subscription {
+                                          warn!(user_id = user.id, error = %error, "subscriber persistence failed after pairing");
+                                      }
+                                  }
+                                  format!("infraCLI source {source} authorized. notifications enabled when permitted")
+                              }
+                              ApproveOutcome::DifferentUser => {
+                                  "this pairing belongs to another Telegram account".to_owned()
+                              }
+                              ApproveOutcome::Expired
+                              | ApproveOutcome::Consumed
+                              | ApproveOutcome::NotFound => {
+                                  "pairing expired or already used. run infra auth again".to_owned()
+                              }
+                          }
+                      }
+                  }
+              };
+
+              if !send_message(
+                  &state.http,
+                  &state.config.telegram_bot_token,
+                  message.chat.id,
+                  &reply,
+              )
+              .await
+              {
+                  warn!(user_id = user.id, "Telegram sendMessage failed");
+              }
+              StatusCode::OK.into_response()
+          }
+
+          fn bearer_token'''
+          text, count = webhook_pattern.subn(webhook, text, count=1)
+          if count != 1:
+              raise SystemExit("telegram_webhook function not found")
+          main.write_text(text)
+
+          infra = Path(".infra")
+          text = infra.read_text()
+          if 'subscriber_user_ids' not in text:
+              text = text.replace(
+                  '        allowed_user_ids = env("TELEGRAM_ALLOWED_USER_IDS")\n',
+                  '        allowed_user_ids = env("TELEGRAM_ALLOWED_USER_IDS")\n        subscriber_user_ids = env("TELEGRAM_SUBSCRIBER_USER_IDS")\n        subscriber_store = "/var/lib/infrabot/subscribers.json"\n        subscriber_events = ["service.failed", "service.recovered", "service.started", "service.removed"]\n'
+              )
+          text = re.sub(r'\n    recipient "owner" \{[\s\S]*?\n    \}\n', '\n', text, count=1)
+          infra.write_text(text)
+
+          for filename in [".env.example", "deploy/vps/env.example"]:
+              path = Path(filename)
+              text = path.read_text()
+              if "TELEGRAM_SUBSCRIBER_USER_IDS=" not in text:
+                  text = text.replace("TELEGRAM_ALLOWED_USER_IDS=\n", "TELEGRAM_ALLOWED_USER_IDS=\nTELEGRAM_SUBSCRIBER_USER_IDS=\n")
+              text = text.replace("TELEGRAM_CHAT_ID=\n", "")
+              path.write_text(text)
+
+          dockerfile = Path("Dockerfile")
+          text = dockerfile.read_text()
+          text = text.replace(
+              '    && rm -rf /var/lib/apt/lists/*',
+              '    && install -d -o 65532 -g 65532 /var/lib/infrabot \\\n    && rm -rf /var/lib/apt/lists/*'
+          )
+          dockerfile.write_text(text)
+
+          compose = Path("deploy/vps/compose.yaml")
+          text = compose.read_text()
+          if 'infrabot-state:/var/lib/infrabot' not in text:
+              text = text.replace(
+                  '    ports:\n      - "127.0.0.1:8787:8787"\n',
+                  '    ports:\n      - "127.0.0.1:8787:8787"\n    volumes:\n      - infrabot-state:/var/lib/infrabot\n'
+              )
+          text = text.replace('volumes:\n  infra-agent-state:\n', 'volumes:\n  infrabot-state:\n  infra-agent-state:\n')
+          compose.write_text(text)
+
+          readme = Path("README.md")
+          text = readme.read_text()
+          section = '''
+          ## Multi-user Telegram subscriptions
+
+          One Telegram bot can broadcast the same filtered infra events to multiple private users. `telegram.allowed_user_ids` remains the operator allowlist for approving CLI pairing. `telegram.subscriber_user_ids` is a separate allowlist for notification recipients and may contain more users.
+
+          Users connect directly in Telegram:
+
+          - `/start` subscribes the current private chat
+          - `/stop` removes that user from broadcasts
+          - `/status` reports the current subscription state
+          - `/start <pairing-token>` authorizes a source for an operator and subscribes that operator when also present in the subscriber allowlist
+
+          Subscriptions are persisted atomically in `telegram.subscriber_store`. Static `recipient` blocks remain optional and are combined with dynamic subscribers using chat ID deduplication. `telegram.subscriber_events` controls which event kinds are broadcast to all connected users.
+          '''
+          if '## Multi-user Telegram subscriptions' not in text:
+              text += section
+          readme.write_text(text)
+
+          deploy_readme = Path("deploy/vps/README.md")
+          text = deploy_readme.read_text()
+          if 'TELEGRAM_SUBSCRIBER_USER_IDS' not in text:
+              text += '''
+
+          ## Telegram subscribers
+
+          `TELEGRAM_ALLOWED_USER_IDS` contains operators allowed to approve infra pairing. `TELEGRAM_SUBSCRIBER_USER_IDS` contains every Telegram user allowed to join the broadcast with `/start`; use comma-separated numeric IDs. Subscription state is persisted in the `infrabot-state` volume and survives container replacement and release rollback.
+          '''
+          deploy_readme.write_text(text)
+          PY
+      - run: cargo fmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      - name: Validate Compose and images
+        run: |
+          cp deploy/vps/env.example deploy/vps/.env
+          docker compose --file deploy/vps/compose.yaml --env-file deploy/vps/.env config --quiet
+          docker build --file Dockerfile --tag infrabot:multi-user .
+      - name: Commit multi-user subscriptions
+        run: |
+          set -Eeuo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml Cargo.lock Dockerfile README.md .env.example .infra src deploy/vps
+          git commit -m "Support persistent multi-user Telegram broadcasts"
+          git push origin HEAD:agent/secure-cli-pairing
