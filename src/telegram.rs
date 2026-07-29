@@ -44,12 +44,7 @@ pub fn start_payload(text: &str) -> Option<&str> {
     (command == "/start").then_some(payload)
 }
 
-pub async fn send_message(
-    client: &Client,
-    bot_token: &str,
-    chat_id: i64,
-    text: &str,
-) -> bool {
+pub async fn send_message(client: &Client, bot_token: &str, chat_id: i64, text: &str) -> bool {
     let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
     client
         .post(url)
