@@ -1,0 +1,99 @@
+name: finalize telegram output
+
+on:
+  push:
+    branches:
+      - agent/secure-cli-pairing
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/secure-cli-pairing
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Finalize Telegram output API
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          main_path = Path("src/main.rs")
+          text = main_path.read_text()
+          replacement = '''fn render_event(source: &str, event: &EventRequest) -> String {
+              let mut lines = vec![
+                  format!("{} · {}", event.kind, event.project),
+                  format!("source: {source}"),
+              ];
+              if event.fields.is_empty() {
+                  if let Some(service) = event.service.as_deref() {
+                      lines.push(format!("service: {service}"));
+                  }
+                  if let Some(status) = event.status.as_deref() {
+                      lines.push(format!("status: {status}"));
+                  }
+              } else {
+                  for (name, value) in &event.fields {
+                      lines.push(format!("{name}: {value}"));
+                  }
+              }
+              lines.push(String::new());
+              lines.push(event.message.trim().to_owned());
+              lines.join("\\n")
+          }
+
+          fn secure_eq'''
+          text, count = re.subn(
+              r'fn render_event\([\s\S]*?\n}\n\nfn secure_eq',
+              replacement,
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("render_event function not found")
+          main_path.write_text(text)
+
+          paths = [
+              Path("README.md"),
+              Path("deploy/vps/README.md"),
+              Path("deploy/vps/infra-agent.infra"),
+          ]
+          for path in paths:
+              doc = path.read_text()
+              doc = doc.replace('driver = "infrabot"', 'driver = "telegram"')
+              doc = doc.replace(
+                  "generic input/output adapter contract",
+                  "Docker input and Telegram output contract",
+              )
+              doc = doc.replace(
+                  "input/output adapter contract",
+                  "Docker input and Telegram output contract",
+              )
+              doc = doc.replace(
+                  "output adapter ID",
+                  "Telegram bot output name",
+              )
+              path.write_text(doc)
+          PY
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      - name: Commit finalized output
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "$(git status --porcelain -- src README.md deploy/vps)" ]]; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src README.md deploy/vps
+          git commit -m "Model output as Telegram bot"
+          git push origin HEAD:agent/secure-cli-pairing
