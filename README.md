@@ -107,10 +107,14 @@ The service listens on `0.0.0.0:8787` by default. Put it behind the shared HTTPS
 Then authorize from every infraCLI host independently:
 
 ```bash
+# laptop
 infra auth telegram --endpoint https://<infrabot-host>
+
+# vps-01
+infra auth telegram --endpoint https://<infrabot-host> --no-open
 ```
 
-Both commands may target the same infraBot URL and the same Telegram bot.
+Both commands target the same infraBot URL and the same Telegram bot. Each Telegram approval completes only the matching one-time pairing session.
 
 ## container
 
