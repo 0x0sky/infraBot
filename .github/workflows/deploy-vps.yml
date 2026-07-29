@@ -16,7 +16,7 @@ on:
         required: false
         type: string
       infra_cli_ref:
-        description: infraCLI branch, tag, or commit to build into the release
+        description: infraCLI branch, tag, or commit packaged into the agent image
         required: true
         type: string
         default: master
@@ -31,7 +31,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     environment:
       name: vps-spaceship-01
     env:
@@ -65,24 +65,19 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Checkout infraCLI
+      - name: Checkout infraCLI agent source
         uses: actions/checkout@v4
         with:
           repository: 0x0sky/infraCLI
           ref: ${{ inputs.infra_cli_ref }}
-          path: .build/infraCLI
+          path: deploy/vps/infraCLI-src
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build infraCLI host binary
+      - name: Validate packaged agent source
         run: |
           set -Eeuo pipefail
-          cargo build --release --locked \
-            --manifest-path .build/infraCLI/Cargo.toml
-          install -D -m 0755 \
-            .build/infraCLI/target/release/infra \
-            deploy/vps/bin/infra
-          deploy/vps/bin/infra --help >/dev/null
+          test -f deploy/vps/infraCLI-src/Dockerfile.agent
+          test -f deploy/vps/infraCLI-src/Cargo.lock
+          grep -Fq 'Command::Agent' deploy/vps/infraCLI-src/src/main.rs
 
       - name: Configure SSH
         run: |
@@ -98,7 +93,7 @@ jobs:
           archive="/tmp/infrabot-${EDGE_TARGET}-${RELEASE_SHA}.tar.gz"
           tar \
             --exclude=.git \
-            --exclude=.build \
+            --exclude='deploy/vps/infraCLI-src/.git' \
             --exclude='deploy/vps/.env' \
             -czf "$archive" .
           scp -P "$SSH_PORT" "$archive" "$SSH_USER@$SSH_HOST:/tmp/"
@@ -118,7 +113,7 @@ jobs:
           previous_release="$(readlink -f "$current_link" 2>/dev/null || true)"
 
           test -f "$shared_env"
-          install -d -m 0755 "$target_root/releases" "$target_root/shared" "$DEPLOY_PATH/bin"
+          install -d -m 0755 "$target_root/releases" "$target_root/shared"
           install -d -m 0700 "$DEPLOY_PATH/credentials"
           rm -rf "$release_dir"
           mkdir -p "$release_dir"
@@ -138,10 +133,6 @@ jobs:
             fi
             exit 1
           fi
-
-          install -m 0755 "$release_dir/deploy/vps/bin/infra" "$DEPLOY_PATH/bin/infra.new"
-          mv -f "$DEPLOY_PATH/bin/infra.new" "$DEPLOY_PATH/bin/infra"
-          "$DEPLOY_PATH/bin/infra" --help >/dev/null
 
           ln -sfn "$release_dir" "$current_link"
           find "$target_root/releases" \
