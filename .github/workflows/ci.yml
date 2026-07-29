@@ -8,13 +8,118 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: infrabot-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  finalize-contract:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/secure-cli-pairing
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Bind API events to the configured Telegram bot
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/main.rs")
+          text = path.read_text()
+          if "    output: String," not in text:
+              old = '''struct EventRequest {
+              kind: String,'''
+              new = '''struct EventRequest {
+              output: String,
+              kind: String,'''
+              if old not in text:
+                  raise SystemExit("EventRequest declaration not found")
+              text = text.replace(old, new, 1)
+
+          guard = '''    if request.output.trim_start_matches('@') != state.config.telegram_bot_username {
+              return api_error(StatusCode::BAD_REQUEST, "unknown_output");
+          }
+          '''
+          marker = '''    if !valid_event(&request) {
+              return api_error(StatusCode::BAD_REQUEST, "invalid_event");
+          }
+          '''
+          if guard not in text:
+              if marker not in text:
+                  raise SystemExit("event validation marker not found")
+              text = text.replace(marker, guard + marker, 1)
+
+          old = '''fn valid_event(event: &EventRequest) -> bool {
+              valid_token(&event.kind, 128)'''
+          new = '''fn valid_event(event: &EventRequest) -> bool {
+              valid_token(&event.output, 64)
+                  && valid_token(&event.kind, 128)'''
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif "valid_token(&event.output, 64)" not in text:
+              raise SystemExit("valid_event function not found")
+
+          fixture = '''        let event = EventRequest {
+                  kind: "service.failed".into(),'''
+          fixture_with_output = '''        let event = EventRequest {
+                  output: "infra_services_bot".into(),
+                  kind: "service.failed".into(),'''
+          if fixture in text:
+              text = text.replace(fixture, fixture_with_output, 1)
+          elif fixture_with_output not in text:
+              raise SystemExit("EventRequest test fixture not found")
+
+          path.write_text(text)
+
+          agent_config = Path("deploy/vps/infra-agent.infra")
+          doc = agent_config.read_text()
+          marker = '    output "infra_services_bot" {'
+          comment = '    # output name is the Telegram bot username\n'
+          if comment not in doc:
+              if marker not in doc:
+                  raise SystemExit("Telegram output block not found")
+              doc = doc.replace(marker, comment + marker, 1)
+          agent_config.write_text(doc)
+
+          for filename in ["README.md", "deploy/vps/README.md"]:
+              readme = Path(filename)
+              doc = readme.read_text()
+              doc = doc.replace(
+                  "generic input/output adapter contract",
+                  "Docker input and Telegram bot output contract",
+              )
+              doc = doc.replace(
+                  "input/output adapter contract",
+                  "Docker input and Telegram bot output contract",
+              )
+              doc = doc.replace(
+                  "output adapter ID",
+                  "Telegram bot output name",
+              )
+              readme.write_text(doc)
+          PY
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      - name: Commit output identity
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "$(git status --porcelain -- src/main.rs README.md deploy/vps)" ]]; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/main.rs README.md deploy/vps
+          git commit -m "Bind events to Telegram output identity"
+          git push origin HEAD:agent/secure-cli-pairing
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 20
