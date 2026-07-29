@@ -5,21 +5,19 @@ mod token;
 
 use anyhow::{Context, Result};
 use axum::{
+    Json, Router,
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use config::Config;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
-use store::{
-    decode_challenge, ApproveOutcome, CreateOutcome, ExchangeOutcome, PairingStore,
-};
+use store::{ApproveOutcome, CreateOutcome, ExchangeOutcome, PairingStore, decode_challenge};
 use subtle::ConstantTimeEq;
-use telegram::{send_message, start_payload, TelegramUpdate};
+use telegram::{TelegramUpdate, send_message, start_payload};
 use token::issue_access_token;
 use tokio::{net::TcpListener, sync::Mutex};
 use tracing::{info, warn};
@@ -180,9 +178,7 @@ async fn exchange_pairing(
             Json(PairingStatus { status: "pending" }),
         )
             .into_response(),
-        ExchangeOutcome::SlowDown => {
-            api_error(StatusCode::TOO_MANY_REQUESTS, "slow_down")
-        }
+        ExchangeOutcome::SlowDown => api_error(StatusCode::TOO_MANY_REQUESTS, "slow_down"),
         ExchangeOutcome::Approved(telegram_user_id) => {
             match issue_access_token(
                 &state.config.signing_secret,
@@ -199,12 +195,8 @@ async fn exchange_pairing(
                 Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "token_issue_failed"),
             }
         }
-        ExchangeOutcome::InvalidVerifier => {
-            api_error(StatusCode::UNAUTHORIZED, "invalid_verifier")
-        }
-        ExchangeOutcome::TooManyAttempts => {
-            api_error(StatusCode::FORBIDDEN, "pairing_locked")
-        }
+        ExchangeOutcome::InvalidVerifier => api_error(StatusCode::UNAUTHORIZED, "invalid_verifier"),
+        ExchangeOutcome::TooManyAttempts => api_error(StatusCode::FORBIDDEN, "pairing_locked"),
         ExchangeOutcome::Expired => api_error(StatusCode::GONE, "pairing_expired"),
         ExchangeOutcome::Consumed => api_error(StatusCode::CONFLICT, "pairing_consumed"),
         ExchangeOutcome::NotFound => api_error(StatusCode::NOT_FOUND, "pairing_not_found"),
@@ -252,9 +244,9 @@ async fn telegram_webhook(
                 "infraCLI authorized. return to the terminal"
             }
             ApproveOutcome::DifferentUser => "this pairing belongs to another Telegram account",
-            ApproveOutcome::Expired
-            | ApproveOutcome::Consumed
-            | ApproveOutcome::NotFound => "pairing expired or already used. run infra auth again",
+            ApproveOutcome::Expired | ApproveOutcome::Consumed | ApproveOutcome::NotFound => {
+                "pairing expired or already used. run infra auth again"
+            }
         }
     };
 
