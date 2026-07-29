@@ -22,23 +22,19 @@ infrabot {
     max_exchange_attempts = 20
 
     telegram {
-        bot_username = env("TELEGRAM_BOT_USERNAME")
+        bot_username = "infra_services_bot"
         bot_token = env("TELEGRAM_BOT_TOKEN")
         webhook_secret = env("TELEGRAM_WEBHOOK_SECRET")
         signing_secret = env("INFRABOT_SIGNING_SECRET")
         allowed_user_ids = env("TELEGRAM_ALLOWED_USER_IDS")
     }
 
-    source "0xda-market" {
+    source "vps-spaceship-01" {
         address = "https://0xda-market.nilx.one"
-    }
-
-    source "0xda-market-bot" {
-        address = "https://0xda-market.nilx.one/bot"
     }
 
     recipient "owner" {
         chat_id = env("TELEGRAM_CHAT_ID")
-        events = ["*"]
+        events = ["service.failed", "service.recovered", "service.started", "service.removed"]
     }
 }
