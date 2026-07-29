@@ -135,6 +135,7 @@ networks:
     name: ${MARKET_EDGE_NETWORK:-nilx-edge}
     external: true
   monitor:
+    name: zero-x-infrabot-${EDGE_TARGET:-vps-spaceship-01}-monitor
     internal: true
 
 volumes:
