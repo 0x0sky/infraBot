@@ -450,10 +450,7 @@ fn render_event(source: &str, event: &EventRequest) -> String {
     }
     lines.push(String::new());
     lines.push(event.message.trim().to_owned());
-    lines.join(
-        "
-",
-    )
+    lines.join("\n")
 }
 
 fn secure_eq(left: &str, right: &str) -> bool {
