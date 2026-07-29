@@ -409,7 +409,7 @@ fn named_block(line: &str, kind: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn assignment<'a>(line_number: usize, line: &'a str) -> Result<(&'a str, &'a str)> {
+fn assignment(line_number: usize, line: &str) -> Result<(&str, &str)> {
     let (key, value) = line
         .split_once('=')
         .with_context(|| format!("line {line_number}: expected assignment or block"))?;
