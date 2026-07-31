@@ -5,7 +5,8 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates \
+    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && install -d -o 65532 -g 65532 /var/lib/infrabot \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/infrabot /usr/local/bin/infrabot
 COPY --from=build /app/.infra /etc/infrabot/.infra

@@ -32,16 +32,28 @@ struct SendMessageRequest<'a> {
     disable_web_page_preview: bool,
 }
 
-pub fn start_payload(text: &str) -> Option<&str> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum TelegramCommand<'a> {
+    Subscribe,
+    Approve(&'a str),
+    Unsubscribe,
+    Status,
+}
+
+pub fn command(text: &str) -> Option<TelegramCommand<'_>> {
     let mut parts = text.split_whitespace();
-    let command = parts.next()?;
-    let payload = parts.next()?;
+    let command = parts.next()?.split('@').next()?;
+    let argument = parts.next();
     if parts.next().is_some() {
         return None;
     }
-
-    let command = command.split('@').next()?;
-    (command == "/start").then_some(payload)
+    match (command, argument) {
+        ("/start", None) => Some(TelegramCommand::Subscribe),
+        ("/start", Some(payload)) => Some(TelegramCommand::Approve(payload)),
+        ("/stop", None) => Some(TelegramCommand::Unsubscribe),
+        ("/status", None) => Some(TelegramCommand::Status),
+        _ => None,
+    }
 }
 
 pub async fn send_message(client: &Client, bot_token: &str, chat_id: i64, text: &str) -> bool {
@@ -63,10 +75,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_start_payload() {
-        assert_eq!(start_payload("/start abc"), Some("abc"));
-        assert_eq!(start_payload("/start@infra_bot abc"), Some("abc"));
-        assert_eq!(start_payload("/start"), None);
-        assert_eq!(start_payload("hello abc"), None);
+    fn parses_commands() {
+        assert_eq!(command("/start"), Some(TelegramCommand::Subscribe));
+        assert_eq!(command("/start abc"), Some(TelegramCommand::Approve("abc")));
+        assert_eq!(
+            command("/start@infra_bot abc"),
+            Some(TelegramCommand::Approve("abc"))
+        );
+        assert_eq!(command("/stop"), Some(TelegramCommand::Unsubscribe));
+        assert_eq!(command("/status"), Some(TelegramCommand::Status));
+        assert_eq!(command("hello"), None);
     }
 }

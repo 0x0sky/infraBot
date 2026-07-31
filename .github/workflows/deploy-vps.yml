@@ -1,0 +1,141 @@
+name: Deploy infraBot to VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Validate the release or activate it on the target
+        required: true
+        type: choice
+        options:
+          - validate
+          - activate
+        default: validate
+      confirmation:
+        description: Type activate-infrabot for activation
+        required: false
+        type: string
+      infra_cli_ref:
+        description: infraCLI branch, tag, or commit packaged into the agent image
+        required: true
+        type: string
+        default: master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infrabot-vps-spaceship-01
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: vps-spaceship-01
+    env:
+      EDGE_TARGET: vps-spaceship-01
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_PORT: ${{ vars.SSH_PORT || '22022' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/infrabot' }}
+      RELEASE_SHA: ${{ github.sha }}
+      DEPLOY_MODE: ${{ inputs.mode }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+
+    steps:
+      - name: Validate workflow input
+        run: |
+          set -Eeuo pipefail
+          test "$EDGE_TARGET" = vps-spaceship-01
+          test -n "$SSH_HOST"
+          test -n "$SSH_USER"
+          test -n "$SSH_PRIVATE_KEY"
+          test "$SSH_PORT" = 22022
+          test "$DEPLOY_PATH" = /opt/infrabot
+          case "$DEPLOY_MODE" in
+            validate) ;;
+            activate)
+              test "$CONFIRMATION" = activate-infrabot
+              ;;
+            *) exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+
+      - name: Checkout infraCLI agent source
+        uses: actions/checkout@v4
+        with:
+          repository: 0x0sky/infraCLI
+          ref: ${{ inputs.infra_cli_ref }}
+          path: deploy/vps/infraCLI-src
+
+      - name: Validate packaged agent source
+        run: |
+          set -Eeuo pipefail
+          test -f deploy/vps/infraCLI-src/Dockerfile.agent
+          test -f deploy/vps/infraCLI-src/Cargo.lock
+          grep -Fq 'Command::Agent' deploy/vps/infraCLI-src/src/main.rs
+
+      - name: Configure SSH
+        run: |
+          set -Eeuo pipefail
+          install -m 0700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" >"$HOME/.ssh/id_ed25519"
+          chmod 0600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >>"$HOME/.ssh/known_hosts"
+
+      - name: Upload release
+        run: |
+          set -Eeuo pipefail
+          archive="/tmp/infrabot-${EDGE_TARGET}-${RELEASE_SHA}.tar.gz"
+          tar \
+            --exclude=.git \
+            --exclude='deploy/vps/infraCLI-src/.git' \
+            --exclude='deploy/vps/.env' \
+            -czf "$archive" .
+          scp -P "$SSH_PORT" "$archive" "$SSH_USER@$SSH_HOST:/tmp/"
+
+      - name: Validate or activate release
+        run: |
+          set -Eeuo pipefail
+          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "DEPLOY_PATH='$DEPLOY_PATH' EDGE_TARGET='$EDGE_TARGET' RELEASE_SHA='$RELEASE_SHA' DEPLOY_MODE='$DEPLOY_MODE' bash -s" <<'REMOTE'
+          set -Eeuo pipefail
+
+          target_root="$DEPLOY_PATH/targets/$EDGE_TARGET"
+          archive="/tmp/infrabot-${EDGE_TARGET}-${RELEASE_SHA}.tar.gz"
+          release_dir="$target_root/releases/$RELEASE_SHA"
+          shared_env="$target_root/shared/.env"
+          current_link="$target_root/current"
+          previous_release="$(readlink -f "$current_link" 2>/dev/null || true)"
+
+          test -f "$shared_env"
+          install -d -m 0755 "$target_root/releases" "$target_root/shared"
+          install -d -m 0700 "$DEPLOY_PATH/credentials"
+          rm -rf "$release_dir"
+          mkdir -p "$release_dir"
+          tar -xzf "$archive" -C "$release_dir"
+          rm -f "$archive"
+          ln -sfn "$shared_env" "$release_dir/deploy/vps/.env"
+
+          if [[ "$DEPLOY_MODE" == validate ]]; then
+            DEPLOY_MODE=validate bash "$release_dir/deploy/vps/deploy.sh"
+            rm -rf "$release_dir"
+            exit 0
+          fi
+
+          if ! DEPLOY_MODE=activate bash "$release_dir/deploy/vps/deploy.sh"; then
+            if [[ -n "$previous_release" && -d "$previous_release/deploy/vps" ]]; then
+              DEPLOY_MODE=activate bash "$previous_release/deploy/vps/deploy.sh" || true
+            fi
+            exit 1
+          fi
+
+          ln -sfn "$release_dir" "$current_link"
+          find "$target_root/releases" \
+            -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+            | sort -nr | tail -n +4 | cut -d' ' -f2- | xargs -r rm -rf
+          REMOTE

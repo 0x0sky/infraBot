@@ -14,7 +14,7 @@ project "infrabot" {
 
 infrabot {
     bind = "0.0.0.0:8787"
-    public_url = env("INFRABOT_PUBLIC_URL")
+    public_url = "https://0xda-market.nilx.one/infra"
     pairing_ttl_seconds = 300
     access_token_ttl_seconds = 2592000
     poll_interval_seconds = 2
@@ -22,23 +22,18 @@ infrabot {
     max_exchange_attempts = 20
 
     telegram {
-        bot_username = env("TELEGRAM_BOT_USERNAME")
+        bot_username = "infra_services_bot"
         bot_token = env("TELEGRAM_BOT_TOKEN")
         webhook_secret = env("TELEGRAM_WEBHOOK_SECRET")
         signing_secret = env("INFRABOT_SIGNING_SECRET")
         allowed_user_ids = env("TELEGRAM_ALLOWED_USER_IDS")
+        subscriber_user_ids = env("TELEGRAM_SUBSCRIBER_USER_IDS")
+        subscriber_store = "/var/lib/infrabot/subscribers.json"
+        subscriber_events = ["service.failed", "service.recovered", "service.started", "service.removed"]
     }
 
-    source "primary" {
-        address = "https://primary.example"
+    source "vps-spaceship-01" {
+        address = "https://0xda-market.nilx.one"
     }
 
-    source "secondary" {
-        address = "https://secondary.example"
-    }
-
-    recipient "owner" {
-        chat_id = env("TELEGRAM_CHAT_ID")
-        events = ["*"]
-    }
 }
